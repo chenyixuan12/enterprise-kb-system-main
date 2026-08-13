@@ -1,0 +1,54 @@
+services:
+  mongo:
+    image: mongo:7
+    container_name: enterprise-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: enterprise-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    restart: unless-stopped
+
+  chroma:
+    image: chromadb/chroma:latest
+    container_name: enterprise-chroma
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma-data:/chroma/chroma
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: enterprise-backend
+    env_file:
+      - .env
+    environment:
+      MONGODB_URI: mongodb://mongo:27017/db_enterprise_qa
+      CHROMA_BASE_URL: http://chroma:8000
+      EMBEDDING_BASE_URL: http://ollama:11434
+      UPLOAD_FILE_DIR: /app/uploads
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./backend/uploads:/app/uploads
+    depends_on:
+      - mongo
+      - ollama
+      - chroma
+    restart: unless-stopped
+
+volumes:
+  mongo-data:
+  ollama-data:
+  chroma-data:

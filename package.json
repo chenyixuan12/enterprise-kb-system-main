@@ -1,0 +1,26 @@
+{
+  "name": "enterprise-kb-system",
+  "private": true,
+  "version": "1.0.0",
+  "engines": {
+    "node": ">=20 <21"
+  },
+  "volta": {
+    "node": "20.19.0"
+  },
+  "scripts": {
+    "dev": "concurrently -n backend,frontend -c blue,green \"npm run dev --prefix backend\" \"npm run dev --prefix frontend\"",
+    "start": "concurrently -n backend,frontend -c blue,green \"npm run start --prefix backend\" \"npm run dev --prefix frontend\"",
+    "build": "npm run build --prefix frontend",
+    "seed": "npm run seed --prefix backend",
+    "deploy": "docker-compose up -d --build",
+    "deploy:stop": "docker-compose down",
+    "deploy:logs": "docker-compose logs -f"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  },
+  "dependencies": {
+    "pnpm": "^11.21.0"
+  }
+}

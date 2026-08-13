@@ -1,0 +1,1680 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "企业知识库问答系统 API",
+    "version": "1.0.0",
+    "description": "企业内部知识库问答后端接口文档。\n\n\n## 鉴权约定（教学演示版）\n\n本项目**不使用 JWT/Session**，登录后由前端在每次请求中携带以下自定义请求头：\n\n| 请求头 | 说明 | 示例 |\n|--------|------|------|\n| `x-user-id` | 用户 MongoDB `_id` | `674a1b2c3d4e5f6789012345` |\n| `x-user-name` | 用户名 | `admin` |\n| `x-user-role` | 角色，`admin` 或 `user` | `admin` |\n\n**流程：**\n1. 调用 `POST /api/auth/login` 获取用户信息\n2. 前端将用户信息存入 `localStorage.enterpriseUser`\n3. Axios/Fetch 拦截器自动注入上述三个请求头\n\n**注意：** 请求头可被客户端伪造，仅适用于教学演示；生产环境应改用 JWT 等标准鉴权方案。\n\n**权限说明：**\n- 标注 `admin` 的接口需 `x-user-role: admin`\n- 未标注的接口通常无需登录，但部分操作会读取 `x-user-id` 记录操作者\n\n\n\n## SSE 流式问答协议\n\n`POST /api/qa/ask` 返回 `text/event-stream`，而非普通 JSON。\n\n**请求：**\n```json\n{\n  \"question\": \"如何申请年假？\",\n  \"categoryId\": \"674a1b2c3d4e5f6789012345\",\n  \"sessionId\": \"可选，续接已有会话\"\n}\n```\n\n**响应事件类型：**\n\n| 事件 | 数据格式 | 说明 |\n|------|----------|------|\n| `sources` | `Source[]` | 召回的参考文档列表 |\n| `mismatch` | `{ message, suggestedKnowledge, suggestedKnowledgeId, recommendedKnowledge }` | 当前知识库与问题不匹配时提示切换 |\n| `chunk` | `string` | LLM 生成的文本片段（流式） |\n| `done` | `{ answer, sessionId, sources, recommendedKnowledge, ... }` | 生成完成 |\n| `error` | `{ message }` | 发生错误 |\n\n**SSE 原始格式示例：**\n```\nevent: sources\ndata: [{\"documentId\":\"...\",\"title\":\"员工手册\",\"snippet\":\"...\"}]\n\nevent: chunk\ndata: \"根据\"\n\nevent: done\ndata: {\"answer\":\"完整答案\",\"sessionId\":\"...\",\"sources\":[...]}\n```\n\n**curl 调试示例：**\n```bash\ncurl -N -X POST http://localhost:3000/api/qa/ask \\\n  -H \"Content-Type: application/json\" \\\n  -H \"x-user-id: YOUR_USER_ID\" \\\n  -H \"x-user-name: admin\" \\\n  -H \"x-user-role: admin\" \\\n  -d '{\"question\":\"如何请假？\",\"categoryId\":\"CATEGORY_ID\"}'\n```\n\n\n\n## 响应格式说明\n\n各模块响应 envelope 不完全统一，对接时请注意：\n\n| 模块 | 成功格式 | 错误格式 |\n|------|----------|----------|\n| auth / users / chat | `{ message, data }` | `{ message, error? }` |\n| knowledge / qa / admin | `{ code, message, data }` | `{ code, message, error? }` |\n| category | `{ code, msg, data }` | `{ code, msg }` |\n"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:3000",
+      "description": "本地开发"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Health",
+      "description": "健康检查"
+    },
+    {
+      "name": "Auth",
+      "description": "登录认证"
+    },
+    {
+      "name": "Users",
+      "description": "用户管理（admin）"
+    },
+    {
+      "name": "Knowledge",
+      "description": "知识文档管理"
+    },
+    {
+      "name": "QA",
+      "description": "流式问答（SSE）"
+    },
+    {
+      "name": "Chat",
+      "description": "会话历史"
+    },
+    {
+      "name": "Admin",
+      "description": "管理后台统计"
+    },
+    {
+      "name": "Category",
+      "description": "知识库分类"
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "UserId": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-user-id",
+        "description": "登录用户的 MongoDB _id"
+      },
+      "UserName": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-user-name",
+        "description": "登录用户名"
+      },
+      "UserRole": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-user-role",
+        "description": "用户角色：admin 或 user"
+      }
+    },
+    "schemas": {
+      "ErrorResponse": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "code": {
+            "type": "integer"
+          },
+          "msg": {
+            "type": "string"
+          },
+          "error": {
+            "type": "string"
+          }
+        }
+      },
+      "User": {
+        "type": "object",
+        "properties": {
+          "_id": {
+            "type": "string"
+          },
+          "username": {
+            "type": "string"
+          },
+          "nickname": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "admin",
+              "user"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "disabled"
+            ]
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "LoginRequest": {
+        "type": "object",
+        "required": [
+          "username",
+          "password"
+        ],
+        "properties": {
+          "username": {
+            "type": "string",
+            "example": "admin"
+          },
+          "password": {
+            "type": "string",
+            "example": "123456"
+          }
+        }
+      },
+      "LoginResponse": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "type": "string",
+            "example": "登录成功"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "_id": {
+                "type": "string"
+              },
+              "username": {
+                "type": "string"
+              },
+              "nickname": {
+                "type": "string"
+              },
+              "role": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "AskRequest": {
+        "type": "object",
+        "required": [
+          "question"
+        ],
+        "properties": {
+          "question": {
+            "type": "string",
+            "example": "如何申请年假？"
+          },
+          "categoryId": {
+            "type": "string",
+            "description": "知识库分类 ID（可选）"
+          },
+          "sessionId": {
+            "type": "string",
+            "description": "会话 ID，用于续接对话（可选）"
+          }
+        }
+      },
+      "Source": {
+        "type": "object",
+        "properties": {
+          "documentId": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "originalName": {
+            "type": "string"
+          },
+          "fileType": {
+            "type": "string"
+          },
+          "snippet": {
+            "type": "string"
+          },
+          "categoryId": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "Category": {
+        "type": "object",
+        "properties": {
+          "_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "inactive"
+            ]
+          },
+          "docCount": {
+            "type": "integer"
+          }
+        }
+      }
+    }
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": [
+          "Health"
+        ],
+        "summary": "健康检查",
+        "description": "用于确认后端服务是否正常运行",
+        "responses": {
+          "200": {
+            "description": "服务正常",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "ok"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/users": {
+      "get": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "获取用户列表",
+        "description": "仅管理员可访问，支持 keyword、role、status 筛选",
+        "security": [
+          {
+            "UserId": [],
+            "UserName": [],
+            "UserRole": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "keyword",
+            "schema": {
+              "type": "string"
+            },
+            "description": "按用户名或昵称模糊搜索"
+          },
+          {
+            "in": "query",
+            "name": "role",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "admin",
+                "user"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "active",
+                "disabled"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/User"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "无权限"
+          },
+          "500": {
+            "description": "服务器错误"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "新增用户",
+        "description": "仅管理员可操作，默认密码为 123456",
+        "security": [
+          {
+            "UserId": [],
+            "UserName": [],
+            "UserRole": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "username"
+                ],
+                "properties": {
+                  "username": {
+                    "type": "string"
+                  },
+                  "password": {
+                    "type": "string",
+                    "default": "123456"
+                  },
+                  "role": {
+                    "type": "string",
+                    "enum": [
+                      "admin",
+                      "user"
+                    ],
+                    "default": "user"
+                  },
+                  "nickname": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "active",
+                      "disabled"
+                    ],
+                    "default": "active"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "创建成功"
+          },
+          "400": {
+            "description": "参数错误或用户名已存在"
+          },
+          "403": {
+            "description": "无权限"
+          },
+          "500": {
+            "description": "服务器错误"
+          }
+        }
+      }
+    },
+    "/api/users/{id}": {
+      "get": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "获取用户详情",
+        "security": [
+          {
+            "UserId": [],
+            "UserName": [],
+            "UserRole": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          },
+          "403": {
+            "description": "无权限"
+          },
+          "404": {
+            "description": "用户不存在"
+          },
+          "500": {
+            "description": "服务器错误"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "更新用户",
+        "security": [
+          {
+            "UserId": [],
+            "UserName": [],
+            "UserRole": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "username": {
+                    "type": "string"
+                  },
+                  "password": {
+                    "type": "string"
+                  },
+                  "role": {
+                    "type": "string",
+                    "enum": [
+                      "admin",
+                      "user"
+                    ]
+                  },
+                  "nickname": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "active",
+                      "disabled"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "更新成功"
+          },
+          "400": {
+            "description": "参数错误"
+          },
+          "403": {
+            "description": "无权限"
+          },
+          "404": {
+            "description": "用户不存在"
+          },
+          "500": {
+            "description": "服务器错误"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "删除用户",
+        "security": [
+          {
+            "UserId": [],
+            "UserName": [],
+            "UserRole": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "删除成功"
+          },
+          "403": {
+            "description": "无权限"
+          },
+          "404": {
+            "description": "用户不存在"
+          },
+          "500": {
+            "description": "服务器错误"
+          }
+        }
+      }
+    },
+    "/api/users/{id}/reset-password": {
+      "patch": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "重置用户密码",
+        "description": "仅管理员可操作，重置为默认密码 123456",
+        "security": [
+          {
+            "UserId": [],
+            "UserName": [],
+            "UserRole": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "密码重置成功"
+          },
+          "403": {
+            "description": "无权限"
+          },
+          "404": {
+            "description": "用户不存在"
+          },
+          "500": {
+            "description": "服务器错误"
+          }
+        }
+      }
+    },
+    "/api/users/{id}/status": {
+      "patch": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "切换用户状态",
+        "security": [
+          {
+            "UserId": [],
+            "UserName": [],
+            "UserRole": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "status"
+                ],
+                "properties": {
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "active",
+                      "disabled"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "状态更新成功"
+          },
+          "403": {
+            "description": "无权限"
+          },
+          "404": {
+            "description": "用户不存在"
+          },
+          "500": {
+            "description": "服务器错误"
+          }
+        }
+      }
+    },
+    "/api/qa/ask": {
+      "post": {
+        "tags": [
+          "QA"
+        ],
+        "summary": "流式问答（SSE）",
+        "description": "核心问答接口，返回 Server-Sent Events 流式响应（`text/event-stream`）。\n\n**事件类型：**\n- `sources` — 召回的参考文档列表\n- `mismatch` — 当前知识库与问题不匹配，建议切换\n- `chunk` — LLM 生成的文本片段\n- `done` — 生成完成，包含完整答案和 sessionId\n- `error` — 发生错误\n\n详细协议说明见文档首页「SSE 流式问答协议」章节。\n",
+        "security": [
+          {
+            "UserId": [],
+            "UserName": [],
+            "UserRole": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AskRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "SSE 流式响应",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string",
+                  "example": "event: sources\ndata: [{\"documentId\":\"...\",\"title\":\"员工手册\"}]\n\nevent: chunk\ndata: \"根据\"\n\nevent: done\ndata: {\"answer\":\"完整答案\",\"sessionId\":\"...\"}\n"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "问题不能为空",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "问答失败"
+          }
+        }
+      }
+    },
+    "/api/knowledge/ai-complete": {
+      "post": {
+        "tags": [
+          "Knowledge"
+        ],
+        "summary": "AI 内容补全",
+        "description": "根据已有正文和光标上下文，由 LLM 续写知识文档内容。仅管理员可用。",
+        "security": [
+          {
+            "UserId": [],
+            "UserName": [],
+            "UserRole": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "content"
+                ],
+                "properties": {
+                  "title": {
+                    "type": "string"
+                  },
+                  "content": {
+                    "type": "string"
+                  },
+                  "cursorContext": {
+                    "type": "string",
+                    "description": "光标附近上下文"
+                  },
+                  "categoryId": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "补全成功"
+          },
+          "400": {
+            "description": "正文不能为空"
+          },
+          "403": {
+            "description": "无权限"
+          },
+          "502": {
+            "description": "LLM 服务异常"
+          }
+        }
+      }
+    },
+    "/api/knowledge": {
+      "get": {
+        "tags": [
+          "Knowledge"
+        ],
+        "summary": "获取知识文档列表",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "categoryId",
+            "schema": {
+              "type": "string"
+            },
+            "description": "按知识库分类筛选"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "type": "object"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/knowledge/{id}": {
+      "get": {
+        "tags": [
+          "Knowledge"
+        ],
+        "summary": "获取知识文档详情",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "查询成功"
+          },
+          "404": {
+            "description": "文档不存在"
+          },
+          "500": {
+            "description": "服务器错误"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Knowledge"
+        ],
+        "summary": "删除知识文档",
+        "description": "仅管理员可操作，同时删除本地文件",
+        "security": [
+          {
+            "UserId": [],
+            "UserName": [],
+            "UserRole": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "删除成功"
+          },
+          "403": {
+            "description": "无权限"
+          },
+          "404": {
+            "description": "文档不存在"
+          },
+          "500": {
+            "description": "服务器错误"
+          }
+        }
+      }
+    },
+    "/api/knowledge/{id}/status": {
+      "get": {
+        "tags": [
+          "Knowledge"
+        ],
+        "summary": "获取文档处理状态",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "查询成功，返回 status、chunkCount、preview 等"
+          },
+          "404": {
+            "description": "文档不存在"
+          },
+          "500": {
+            "description": "服务器错误"
+          }
+        }
+      }
+    },
+    "/api/knowledge/manual": {
+      "post": {
+        "tags": [
+          "Knowledge"
+        ],
+        "summary": "手动录入知识文档",
+        "description": "仅管理员可操作，直接以文本形式创建文档",
+        "security": [
+          {
+            "UserId": [],
+            "UserName": [],
+            "UserRole": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "title",
+                  "content",
+                  "categoryId"
+                ],
+                "properties": {
+                  "title": {
+                    "type": "string"
+                  },
+                  "content": {
+                    "type": "string"
+                  },
+                  "categoryId": {
+                    "type": "string"
+                  },
+                  "originalName": {
+                    "type": "string"
+                  },
+                  "fileType": {
+                    "type": "string"
+                  },
+                  "fileSize": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "知识新增成功"
+          },
+          "400": {
+            "description": "参数错误"
+          },
+          "403": {
+            "description": "无权限"
+          },
+          "500": {
+            "description": "服务器错误"
+          }
+        }
+      }
+    },
+    "/api/knowledge/upload": {
+      "post": {
+        "tags": [
+          "Knowledge"
+        ],
+        "summary": "上传知识文档",
+        "description": "支持 txt、pdf、docx、md 格式，单文件最大 10MB。\n使用 multipart/form-data，字段 file 为文件，title 和 categoryId 为表单字段。\n无需 admin 权限，但会记录 x-user-id 作为上传者。\n",
+        "security": [
+          {
+            "UserId": [],
+            "UserName": [],
+            "UserRole": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "file",
+                  "categoryId"
+                ],
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary"
+                  },
+                  "title": {
+                    "type": "string",
+                    "description": "文档标题，默认取文件名"
+                  },
+                  "categoryId": {
+                    "type": "string",
+                    "description": "所属知识库分类 ID（必填）"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "文件上传成功，文档已入库"
+          },
+          "400": {
+            "description": "文件或分类参数错误"
+          },
+          "500": {
+            "description": "服务器错误"
+          }
+        }
+      }
+    },
+    "/api/chat/admin/all": {
+      "get": {
+        "tags": [
+          "Chat"
+        ],
+        "summary": "管理员查看所有会话",
+        "security": [
+          {
+            "UserId": [],
+            "UserName": [],
+            "UserRole": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          },
+          "403": {
+            "description": "无权限"
+          },
+          "500": {
+            "description": "服务器错误"
+          }
+        }
+      }
+    },
+    "/api/chat": {
+      "get": {
+        "tags": [
+          "Chat"
+        ],
+        "summary": "获取当前用户会话列表",
+        "security": [
+          {
+            "UserId": [],
+            "UserName": [],
+            "UserRole": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "categoryId",
+            "schema": {
+              "type": "string"
+            },
+            "description": "按知识库分类筛选"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          },
+          "500": {
+            "description": "服务器错误"
+          }
+        }
+      }
+    },
+    "/api/chat/{id}": {
+      "get": {
+        "tags": [
+          "Chat"
+        ],
+        "summary": "获取会话详情",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功"
+          },
+          "404": {
+            "description": "会话不存在"
+          },
+          "500": {
+            "description": "服务器错误"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Chat"
+        ],
+        "summary": "删除会话",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "删除成功"
+          },
+          "404": {
+            "description": "会话不存在"
+          },
+          "500": {
+            "description": "服务器错误"
+          }
+        }
+      }
+    },
+    "/api/chat/save": {
+      "post": {
+        "tags": [
+          "Chat"
+        ],
+        "summary": "手动保存会话",
+        "description": "兼容手动存储会话，QA 流式完成后也可调用",
+        "security": [
+          {
+            "UserId": [],
+            "UserName": [],
+            "UserRole": []
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "sessionId": {
+                    "type": "string"
+                  },
+                  "categoryId": {
+                    "type": "string"
+                  },
+                  "question": {
+                    "type": "string"
+                  },
+                  "answer": {
+                    "type": "string"
+                  },
+                  "sources": {
+                    "type": "array",
+                    "items": {
+                      "type": "object"
+                    }
+                  },
+                  "history": {
+                    "type": "array",
+                    "items": {
+                      "type": "object"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "会话保存成功"
+          },
+          "500": {
+            "description": "服务器错误"
+          }
+        }
+      }
+    },
+    "/api/auth/login": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "用户登录",
+        "description": "校验用户名密码，返回用户基础信息。前端登录后将信息存入 localStorage，后续请求通过 x-user-* 请求头携带身份。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "登录成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "用户名或密码错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "服务器错误"
+          }
+        }
+      }
+    },
+    "/api/auth/password-tip": {
+      "get": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "获取默认测试密码提示",
+        "description": "教学演示用，返回统一默认密码说明",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "默认测试密码统一为 123456"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/admin/dashboard": {
+      "get": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "管理后台首页统计",
+        "description": "返回用户数、文档数、今日提问数等，用于 ECharts 展示。当前无权限校验。",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "userCount": {
+                          "type": "integer"
+                        },
+                        "adminCount": {
+                          "type": "integer"
+                        },
+                        "docCount": {
+                          "type": "integer"
+                        },
+                        "processedCount": {
+                          "type": "integer"
+                        },
+                        "failedCount": {
+                          "type": "integer"
+                        },
+                        "categoryCount": {
+                          "type": "integer"
+                        },
+                        "todayQuestions": {
+                          "type": "integer"
+                        },
+                        "docStatus": {
+                          "type": "array"
+                        },
+                        "userRoleStats": {
+                          "type": "array"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/admin/category-stats": {
+      "get": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "知识库文档占比统计",
+        "description": "按知识库分组统计文档数量，用于饼状图。当前无权限校验。",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "integer",
+                      "example": 200
+                    },
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "name": {
+                            "type": "string"
+                          },
+                          "value": {
+                            "type": "integer"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "服务器错误"
+          }
+        }
+      }
+    },
+    "/api/admin/question-trend": {
+      "get": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "提问趋势统计",
+        "description": "返回最近 N 天每日提问数量，用于折线图。当前无权限校验。",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "days",
+            "schema": {
+              "type": "integer",
+              "default": 7
+            },
+            "description": "统计天数（含今天）"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "integer",
+                      "example": 200
+                    },
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "date": {
+                            "type": "string",
+                            "example": "2026-07-16"
+                          },
+                          "count": {
+                            "type": "integer"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "服务器错误"
+          }
+        }
+      }
+    },
+    "/api/category": {
+      "post": {
+        "tags": [
+          "Category"
+        ],
+        "summary": "新增知识库分类",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "description": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "创建成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "integer"
+                    },
+                    "msg": {
+                      "type": "string"
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/Category"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "Category"
+        ],
+        "summary": "获取知识库分类列表",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "status",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "active",
+                "inactive"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "schema": {
+              "type": "integer",
+              "default": 1
+            }
+          },
+          {
+            "in": "query",
+            "name": "pageSize",
+            "schema": {
+              "type": "integer",
+              "default": 10
+            }
+          },
+          {
+            "in": "query",
+            "name": "title",
+            "schema": {
+              "type": "string"
+            },
+            "description": "按名称搜索（title 或 name 均可）"
+          },
+          {
+            "in": "query",
+            "name": "name",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "获取成功，含分页和 docCount"
+          }
+        }
+      }
+    },
+    "/api/category/{id}": {
+      "get": {
+        "tags": [
+          "Category"
+        ],
+        "summary": "获取分类详情",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "获取成功"
+          },
+          "404": {
+            "description": "知识库不存在"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Category"
+        ],
+        "summary": "更新知识库分类",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "description": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "active",
+                      "inactive"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "更新成功"
+          },
+          "404": {
+            "description": "知识库不存在"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Category"
+        ],
+        "summary": "删除知识库分类",
+        "description": "删除分类并将关联文档的 categoryId 设为 null",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "删除成功"
+          },
+          "404": {
+            "description": "知识库不存在"
+          }
+        }
+      }
+    },
+    "/api/category/{id}/status": {
+      "put": {
+        "tags": [
+          "Category"
+        ],
+        "summary": "切换分类状态",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "status"
+                ],
+                "properties": {
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "active",
+                      "inactive"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "状态更新成功"
+          },
+          "400": {
+            "description": "状态参数错误"
+          },
+          "404": {
+            "description": "知识库不存在"
+          }
+        }
+      }
+    }
+  }
+}
