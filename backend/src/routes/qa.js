@@ -1,24 +1,28 @@
 import { Router } from 'express';
-import path from 'path';
 import mongoose from 'mongoose';
 import KnowledgeDocument from '../models/KnowledgeDocument.js';
 import KnowledgeCategory from '../models/knowledgeCategory.js';
 import ChatSession from '../models/ChatSession.js';
 import QALog from '../models/QALog.js';
 import { generateAnswer, generateAnswerStream, embedQuery } from '../services/ollamaService.js';
-import { extractTextFromFile } from '../services/documentService.js';
 import { queryChunks } from '../services/chromaService.js';
+import { retrieveByBM25, fuseRanks, tokenize } from '../services/bm25Service.js';
+import { getRequestUser } from '../utils/auth.js';
 
 const router = Router();
-const MAX_RECALL_DOCS = 5;
 const MAX_RECALL_CHUNKS = 5;
 const MAX_SOURCE_DOCS = 3;
 const MAX_CONTEXT_CHARS = 6000;
 const SOURCE_SCORE_THRESHOLD = 0.2;
 const LOW_MATCH_THRESHOLD = 4;
-const LOW_MATCH_MESSAGE = '建议切换到更匹配的知识库后再提问。';
-const LOCATION_QUERY_TERMS = ['在哪里', '在哪', '哪里', '怎么去', '怎么走', '位置', '地址', '几楼', '在哪一层', '餐厅', '食堂', '停车场', '会议室', '健身房', '休息区', '洗手间', '卫生间'];
-const GUIDE_DOC_TERMS = ['指南', '手册', '说明', '使用说明', '使用指南', '入职', '导览', '流程', '介绍'];
+const RECOMMENDATION_MIN_SCORE = LOW_MATCH_THRESHOLD;
+// 召回阶段各路的候选条数：稠密向量和 BM25 都先多取一些，再融合精排到最终 topK。
+const DENSE_RECALL_K = 30;
+const BM25_RECALL_K = 30;
+// 只有当稠密相似度达到该值才算“语义上确实相关”，避免只靠标题关键词误判。
+const DENSE_CONFIRM_THRESHOLD = 0.5;
+// LLM 答不出内容时常见的兜底短语，命中后视为当前知识库未真正回答，转而推荐其他知识库。
+const NON_ANSWER_MARKERS = ['无法确定', '暂时无法', '没有找到', '未找到', '暂未找到', '找不到', '无法回答', '没有相关', '未提及', '暂无法', '没有信息', '无相关内容'];
 
 function sendSSE(res, type, data) {
   try {
@@ -123,35 +127,7 @@ function scoreDocument(doc, keywords, categoryId) {
     score += 1;
   }
 
-  const locationQuery = keywords.some((kw) => LOCATION_QUERY_TERMS.some((term) => kw.includes(term) || term.includes(kw)));
-  if (locationQuery) {
-    if (GUIDE_DOC_TERMS.some((term) => title.includes(term) || originalName.includes(term) || content.slice(0, 1200).includes(term))) {
-      score += 8;
-    }
-    if (content.includes('餐厅') || content.includes('食堂') || content.includes('会议室') || content.includes('停车场') || content.includes('位置')) {
-      score += 6;
-    }
-  }
-
   return score;
-}
-
-async function loadDocumentContent(doc) {
-  if (doc.content && String(doc.content).trim()) {
-    return String(doc.content);
-  }
-
-  if (!doc.localPath) return '';
-
-  const filePath = path.resolve(doc.localPath);
-  try {
-    const ext = String(doc.fileType || '').toLowerCase();
-    const content = await extractTextFromFile(filePath, ext);
-    return String(content || '');
-  } catch (error) {
-    console.error('[QA] 按需读取文件失败', { documentId: String(doc._id), localPath: doc.localPath, fileType: doc.fileType, error: error?.message || error });
-    return '';
-  }
 }
 
 function buildContext(chunksWithContent) {
@@ -234,57 +210,92 @@ function buildRecommendedKnowledge(scoredDocs, categoriesById) {
     .slice(0, 3);
 }
 
-function calculateKeywordBoost(question) {
-  const normalized = normalizeText(question);
-  const locationQuery = LOCATION_QUERY_TERMS.some((term) => normalized.includes(term));
-  const guideQuery = GUIDE_DOC_TERMS.some((term) => normalized.includes(term));
-  return {
-    locationQuery,
-    guideQuery,
-    bonus: (locationQuery ? 2 : 0) + (guideQuery ? 1 : 0)
-  };
-}
-
-async function buildHybridCandidates(question, docsById) {
+function buildHybridCandidates(question, docs, { vectorHits = [], bm25Hits = [] } = {}) {
   const keywords = extractKeywords(question);
-  const docs = [...docsById.values()];
-  const vectorScoreMap = new Map();
 
-  try {
-    const questionEmbedding = await embedQuery(question.trim());
-    const vectorHits = await queryChunks(questionEmbedding, { topK: MAX_RECALL_DOCS * 4 });
-    for (const hit of vectorHits) {
-      const documentId = String(hit.metadata?.documentId || '');
-      if (!documentId) continue;
-      const previousScore = vectorScoreMap.get(documentId) || 0;
-      vectorScoreMap.set(documentId, Math.max(previousScore, Number(hit.score || 0)));
-    }
-  } catch (error) {
-    console.error('[QA] 全局向量召回失败，退回关键词推荐', error?.message || error);
+  const vectorScoreMap = new Map();
+  for (const hit of vectorHits) {
+    const documentId = String(hit.metadata?.documentId || '');
+    if (!documentId) continue;
+    const previousScore = vectorScoreMap.get(documentId) || 0;
+    vectorScoreMap.set(documentId, Math.max(previousScore, Number(hit.score || 0)));
   }
 
-  const queryBoost = calculateKeywordBoost(question);
+  const bm25ScoreMap = new Map();
+  for (const hit of bm25Hits) {
+    const documentId = String(hit.metadata?.documentId || '');
+    if (!documentId) continue;
+    const previousScore = bm25ScoreMap.get(documentId) || 0;
+    bm25ScoreMap.set(documentId, Math.max(previousScore, Number(hit.bm25Score || 0)));
+  }
 
-  return {
-    hybrid: docs.map((doc) => {
-      const keywordScore = scoreDocument(doc, keywords, null);
-      const vectorScore = vectorScoreMap.get(String(doc._id)) || 0;
-      const titleText = normalizeText(doc.title);
-      const nameText = normalizeText(doc.originalName);
-      const contentText = normalizeText(doc.content || '');
-      const relevanceBonus = queryBoost.locationQuery && (titleText.includes('指南') || nameText.includes('指南') || contentText.includes('位置') || contentText.includes('餐厅') || contentText.includes('食堂')) ? 3 : 0;
-      const hybridScore = keywordScore + vectorScore * 40 + queryBoost.bonus + relevanceBonus;
+  return docs.map((doc) => {
+    const keywordScore = scoreDocument(doc, keywords, null);
+    const vectorScore = vectorScoreMap.get(String(doc._id)) || 0;
+    const bm25Score = bm25ScoreMap.get(String(doc._id)) || 0;
+    const hybridScore = keywordScore + vectorScore * 40 + Math.min(bm25Score, 8) * 5;
 
-      return {
-        doc,
-        keywordScore,
-        vectorScore,
-        hybridScore,
-        content: String(doc.content || '')
-      };
-    }),
-    chromaHits: [...vectorScoreMap.entries()].map(([documentId, score]) => ({ documentId, score }))
-  };
+    return {
+      doc,
+      keywordScore,
+      vectorScore,
+      bm25Score,
+      hybridScore,
+      content: String(doc.content || '')
+    };
+  });
+}
+
+// 判断当前知识库的召回结果是否足以回答：
+// - 稠密相似度足够高（>= DENSE_CONFIRM_THRESHOLD）说明语义上确实相关；
+// - 或者稠密分不低且查询关键词能回到答案片段（含 BM25 命中）。
+function hasAnswerEvidence(denseHits, fusedChunks, question) {
+  if (!denseHits.length) return false;
+
+  const bestDense = Math.max(...denseHits.map((hit) => Number(hit.score || 0)));
+  const bm25Scores = fusedChunks.map((chunk) => Number(chunk.bm25Score || 0));
+  const bestBm25 = bm25Scores.length ? Math.max(...bm25Scores) : 0;
+
+  const queryTerms = tokenize(question).filter((term) => term.length >= 2);
+  const candidateText = fusedChunks
+    .slice(0, 3)
+    .map((chunk) => normalizeText(chunk.content || ''))
+    .join(' ');
+
+  const overlap = queryTerms.length
+    ? queryTerms.filter((term) => candidateText.includes(term)).length
+    : 0;
+  const overlapRatio = queryTerms.length ? overlap / queryTerms.length : 0;
+
+  // 1) 语义相似度过低，直接判定无答案。
+  if (bestDense < SOURCE_SCORE_THRESHOLD) return false;
+  // 2) 关键词命中比例过低，说明问题与当前片段内容无关，判定无答案。
+  if (overlapRatio < 0.5) return false;
+
+  // 语义足够强，或关键词命中足够多，或 BM25 有得分，满足其一即可认为有答案。
+  return bestDense >= DENSE_CONFIRM_THRESHOLD || overlapRatio >= 0.75 || bestBm25 > 0;
+}
+
+// 当前知识库没有可靠结果时，在其他知识库中找出最相关的一个作为切换建议。
+async function findAlternativeRecommendation(question, currentCategoryId, allDocs, categoriesById, questionEmbedding) {
+  const otherDocs = allDocs.filter((doc) => String(doc.categoryId || '') !== String(currentCategoryId));
+  const [globalDenseHits, globalBm25Hits] = await Promise.all([
+    queryChunks(questionEmbedding, { topK: DENSE_RECALL_K }).catch(() => []),
+    retrieveByBM25(question, { topK: BM25_RECALL_K }).catch(() => [])
+  ]);
+
+  const alternativeHybridDocs = await buildHybridCandidates(question, otherDocs, {
+    vectorHits: globalDenseHits,
+    bm25Hits: globalBm25Hits
+  });
+
+  // 推荐也必须达到“能回答问题”的语义证据线（DENSE_CONFIRM_THRESHOLD），
+  // 否则说明所有知识库都没有相关内容，不应给出任何切换建议。
+  const reliableDocs = alternativeHybridDocs.filter((item) => item.vectorScore >= DENSE_CONFIRM_THRESHOLD);
+
+  const recommended = buildRecommendedKnowledge(reliableDocs, categoriesById);
+  const top = recommended[0] || null;
+  return { recommendedKnowledge: top ? recommended : [], suggestedCategory: top };
 }
 
 /**
@@ -368,115 +379,152 @@ router.post('/ask', async (req, res) => {
 
     // 获取所有文档（用于推荐最佳知识库）
     const allDocs = await KnowledgeDocument.find({}).lean();
-    const docsById = new Map(allDocs.map((doc) => [String(doc._id), doc]));
-    
+
     // 根据是否选择了知识库过滤文档
-    const query = {};
-    if (categoryId) {
-      query.categoryId = categoryId;
-    }
-    const docs = categoryId 
-      ? allDocs.filter(doc => String(doc.categoryId || '') === String(categoryId))
-      : allDocs;
-    
-    console.log('[QA] 候选文档数量', docs.length);
+    console.log('[QA] 候选文档数量', allDocs.length);
 
     const categories = await KnowledgeCategory.find({}, { _id: 1, name: 1 }).lean();
     const categoriesById = new Map(categories.map((item) => [String(item._id), item.name]));
 
-    const { hybrid: allHybridDocs } = await buildHybridCandidates(question.trim(), docsById);
-    const recommendedKnowledge = buildRecommendedKnowledge(allHybridDocs, categoriesById);
-    const suggestedCategory = recommendedKnowledge[0] || null;
-
-    const { hybrid: hybridDocs } = await buildHybridCandidates(question.trim(), docsById);
-    const bestHybridScore = hybridDocs.length ? Math.max(...hybridDocs.map((item) => item.hybridScore)) : 0;
-    const bestHybridDoc = hybridDocs.slice().sort((a, b) => b.hybridScore - a.hybridScore)[0] || null;
-    const currentCategoryScore = categoryId
-      ? hybridDocs.filter((item) => String(item.doc.categoryId || '') === String(categoryId)).reduce((max, item) => Math.max(max, item.hybridScore), 0)
-      : 0;
-    const suggestedCategoryScore = suggestedCategory?.score || 0;
-    const hasGoodMatch = bestHybridScore >= LOW_MATCH_THRESHOLD && bestHybridScore > 0;
-    const currentBestMatchTitle = bestHybridDoc?.doc?.title || '';
-    const topRecommended = recommendedKnowledge[0] || null;
+    const questionEmbedding = await embedQuery(question.trim());
     const currentCategory = categoryId ? categoriesById.get(String(categoryId)) : '';
-    const currentCategoryIsTop = topRecommended && categoryId && String(categoryId) === String(topRecommended.id);
-    const scoreGap = suggestedCategoryScore - currentCategoryScore;
-    const shouldRecommendSwitch = topRecommended
-      && (!currentCategoryIsTop || currentCategoryScore < LOW_MATCH_THRESHOLD)
-      && (scoreGap >= 1.5 || currentCategoryScore < LOW_MATCH_THRESHOLD);
 
-    if ((!hasGoodMatch || shouldRecommendSwitch) && topRecommended && (!currentCategoryIsTop || scoreGap > 0.8)) {
-      const recommendationText = currentCategory
-        ? `你当前选择的是「${currentCategory}」，但这个问题和当前知识库相关性较低。`
-        : '当前选择的知识库与问题相关性较低。';
-      const shouldForceSwitch = !currentCategoryIsTop || scoreGap >= 1.5;
+    // 1) 对当前知识库做 chunk 级双路召回：Chroma 稠密 + BM25 稀疏，RRF 融合。
+    let currentDenseHits = [];
+    let currentBm25Hits = [];
+    let fusedChunks = [];
+    let currentHasGoodMatch = false;
 
-      sendSSE(res, 'mismatch', {
-        message: `${recommendationText} ${LOW_MATCH_MESSAGE}`,
-        suggestedKnowledge: topRecommended.name,
-        suggestedKnowledgeId: topRecommended.id,
-        recommendedKnowledge,
-        currentCategoryScore,
-        suggestedCategoryScore,
-        currentCategoryName: currentCategory || '',
-        topMatchedDocument: currentBestMatchTitle,
-        isHighlyRelevant: false,
-        scoreGap: Number(scoreGap.toFixed(2)),
-        shouldForceSwitch
+    if (categoryId) {
+      [currentDenseHits, currentBm25Hits] = await Promise.all([
+        queryChunks(questionEmbedding, { categoryId, topK: DENSE_RECALL_K }).catch((error) => {
+          console.error('[QA] 当前知识库向量召回失败', error?.message || error);
+          return [];
+        }),
+        retrieveByBM25(question.trim(), { categoryId, topK: BM25_RECALL_K }).catch((error) => {
+          console.error('[QA] 当前知识库 BM25 召回失败', error?.message || error);
+          return [];
+        })
+      ]);
+      fusedChunks = fuseRanks(currentDenseHits, currentBm25Hits, MAX_RECALL_CHUNKS);
+      currentHasGoodMatch = hasAnswerEvidence(currentDenseHits, fusedChunks, question.trim());
+      console.log('[QA] 当前知识库召回', {
+        denseHits: currentDenseHits.length,
+        bm25Hits: currentBm25Hits.length,
+        fused: fusedChunks.length,
+        hasGoodMatch: currentHasGoodMatch
       });
+    } else {
+      // 未选知识库时全库检索直接回答
+      const [globalDense, globalBm25] = await Promise.all([
+        queryChunks(questionEmbedding, { topK: DENSE_RECALL_K }).catch(() => []),
+        retrieveByBM25(question.trim(), { topK: BM25_RECALL_K }).catch(() => [])
+      ]);
+      fusedChunks = fuseRanks(globalDense, globalBm25, MAX_RECALL_CHUNKS);
+      currentHasGoodMatch = fusedChunks.length > 0;
     }
 
-    console.log('[QA] 混合召回结果', hybridDocs.map((item) => ({ id: String(item.doc._id), title: item.doc.title, keywordScore: item.keywordScore, vectorScore: item.vectorScore, hybridScore: item.hybridScore })));
+    const currentCategoryScore = currentDenseHits[0] ? Number(currentDenseHits[0].score) : 0;
+    console.log('[QA] 融合后 chunk', fusedChunks.map((chunk) => ({
+      chunkId: chunk.id,
+      title: chunk.metadata?.title,
+      denseScore: chunk.denseScore,
+      bm25Score: chunk.bm25Score,
+      fusedScore: chunk.fusedScore
+    })));
 
-    const ranked = hybridDocs
-      .sort((a, b) => b.hybridScore - a.hybridScore)
-      .slice(0, MAX_RECALL_DOCS)
-      .map((item) => item.doc);
+    // 2) 当前知识库回答不了时，自动路由到最相关的其他知识库，重新检索并直接回答。
+    let recommendedKnowledge = [];
+    let suggestedCategory = null;
+    let routedCategoryId = null;
+    let routedCategoryName = '';
+    let autoSwitched = false;
 
-    console.log('[QA] 排名前', ranked.map((doc) => ({ id: String(doc._id), title: doc.title, localPath: doc.localPath }))); 
+    if (categoryId && !currentHasGoodMatch) {
+      const alt = await findAlternativeRecommendation(question.trim(), categoryId, allDocs, categoriesById, questionEmbedding);
+      recommendedKnowledge = alt.recommendedKnowledge;
+      suggestedCategory = alt.suggestedCategory;
 
-    const docsWithContent = [];
-    for (const doc of ranked) {
-      const content = await loadDocumentContent(doc);
-      console.log('[QA] 读取文件结果', {
-        documentId: String(doc._id),
-        title: doc.title,
-        contentLength: content.length
-      });
-      if (content.trim()) {
-        docsWithContent.push({
-          doc,
-          content,
-          score: hybridDocs.find((item) => String(item.doc._id) === String(doc._id))?.hybridScore || 0
+      if (suggestedCategory && suggestedCategory.score >= RECOMMENDATION_MIN_SCORE) {
+        // 自动路由：用推荐知识库重新做双路召回，确认有可靠答案后替换当前召回结果。
+        const [routedDenseHits, routedBm25Hits] = await Promise.all([
+          queryChunks(questionEmbedding, { categoryId: suggestedCategory.id, topK: DENSE_RECALL_K }).catch((error) => {
+            console.error('[QA] 路由知识库向量召回失败', error?.message || error);
+            return [];
+          }),
+          retrieveByBM25(question.trim(), { categoryId: suggestedCategory.id, topK: BM25_RECALL_K }).catch((error) => {
+            console.error('[QA] 路由知识库 BM25 召回失败', error?.message || error);
+            return [];
+          })
+        ]);
+
+        const routedFusedChunks = fuseRanks(routedDenseHits, routedBm25Hits, MAX_RECALL_CHUNKS);
+        const routedHasGoodMatch = hasAnswerEvidence(routedDenseHits, routedFusedChunks, question.trim());
+
+        if (routedHasGoodMatch) {
+          fusedChunks = routedFusedChunks;
+          currentHasGoodMatch = true;
+          routedCategoryId = suggestedCategory.id;
+          routedCategoryName = suggestedCategory.name;
+          autoSwitched = true;
+
+          sendSSE(res, 'mismatch', {
+            message: `当前知识库「${currentCategory || '未命名'}」没有相关内容，已自动切换并参考「${routedCategoryName}」回答。`,
+            autoSwitched: true,
+            answeredByKnowledgeId: routedCategoryId,
+            answeredByKnowledge: routedCategoryName,
+            suggestedKnowledge: routedCategoryName,
+            suggestedKnowledgeId: routedCategoryId,
+            recommendedKnowledge: [],
+            currentCategoryScore,
+            suggestedCategoryScore: suggestedCategory.score,
+            currentCategoryName: currentCategory || '',
+            topMatchedDocument: '',
+            isHighlyRelevant: true,
+            scoreGap: Number((suggestedCategory.score - currentCategoryScore).toFixed(2)),
+            shouldForceSwitch: false
+          });
+        } else {
+          recommendedKnowledge = [];
+          suggestedCategory = null;
+          sendSSE(res, 'mismatch', {
+            message: `当前知识库「${currentCategory || '未命名'}」没有相关内容，其他知识库也未检索到可靠答案。`,
+            suggestedKnowledge: '',
+            suggestedKnowledgeId: '',
+            recommendedKnowledge: [],
+            currentCategoryScore,
+            suggestedCategoryScore: 0,
+            currentCategoryName: currentCategory || '',
+            topMatchedDocument: '',
+            isHighlyRelevant: false,
+            scoreGap: 0,
+            shouldForceSwitch: false
+          });
+        }
+      } else {
+        recommendedKnowledge = [];
+        suggestedCategory = null;
+        sendSSE(res, 'mismatch', {
+          message: `当前知识库「${currentCategory || '未命名'}」没有相关内容。`,
+          suggestedKnowledge: '',
+          suggestedKnowledgeId: '',
+          recommendedKnowledge: [],
+          currentCategoryScore,
+          suggestedCategoryScore: 0,
+          currentCategoryName: currentCategory || '',
+          topMatchedDocument: '',
+          isHighlyRelevant: false,
+          scoreGap: 0,
+          shouldForceSwitch: false
         });
       }
     }
 
-    const keywordContext = buildContext(docsWithContent);
-    console.log('[QA] 关键词召回上下文长度', keywordContext.length);
-
-    let retrievedChunks = [];
-    try {
-      const questionEmbedding = await embedQuery(question.trim());
-      retrievedChunks = await queryChunks(questionEmbedding, {
-        categoryId: categoryId || undefined,
-        topK: MAX_RECALL_CHUNKS
-      });
-      console.log('[QA] Chroma Chunk 召回结果', retrievedChunks.map((chunk) => ({
-        chunkId: chunk.id,
-        title: chunk.metadata?.title,
-        score: chunk.score
-      })));
-    } catch (retrievalError) {
-      console.error('[QA] Chroma 检索失败，回退到关键词检索', retrievalError.message);
-    }
-
-    const context = retrievedChunks.length > 0 ? buildContext(retrievedChunks) : keywordContext;
+    const retrievedChunks = currentHasGoodMatch ? fusedChunks : [];
+    const context = currentHasGoodMatch ? buildContext(retrievedChunks) : '';
     console.log('[QA] 最终上下文长度', context.length);
 
-    const sources = retrievedChunks.length > 0
-      ? pickTopSources(retrievedChunks, MAX_SOURCE_DOCS)
-      : pickTopSources(docsWithContent, MAX_SOURCE_DOCS);
+    const sources = currentHasGoodMatch ? pickTopSources(retrievedChunks, MAX_SOURCE_DOCS) : [];
     console.log('[QA] 返回 sources 数量', sources.length);
 
     sendSSE(res, 'sources', sources);
@@ -491,6 +539,88 @@ router.post('/ask', async (req, res) => {
       if (category) categoryName = category.name;
     }
 
+    // 自动路由后，实际回答来自推荐知识库，日志与会话按实际回答库记录。
+    const answeredCategoryId = autoSwitched ? routedCategoryId : (categoryId || null);
+    const answeredCategoryName = autoSwitched ? routedCategoryName : categoryName;
+
+    if (!currentHasGoodMatch) {
+      const noMatchAnswer = suggestedCategory
+        ? '当前知识库没有找到答案，已为你推荐更相关的知识库。'
+        : '当前系统知识库无相关内容。';
+
+      const responseTime = Date.now() - startTime;
+      try {
+        await QALog.create({
+          question: question.trim(),
+          answer: noMatchAnswer,
+          categoryId: answeredCategoryId,
+          categoryName: answeredCategoryName,
+          userId: getRequestUser(req).userId || null,
+          sources: [],
+          sessionId: finalSessionId,
+          responseTime,
+          status: 'failed',
+          errorMessage: noMatchAnswer
+        });
+        console.log('[QA] 问答日志已记录');
+      } catch (logError) {
+        console.error('[QA] 记录问答日志失败:', logError);
+      }
+
+      try {
+        const userId = getRequestUser(req).userId;
+        const userObjectId = userId && mongoose.Types.ObjectId.isValid(userId)
+          ? new mongoose.Types.ObjectId(userId)
+          : null;
+        const categoryObjectId = answeredCategoryId && mongoose.Types.ObjectId.isValid(answeredCategoryId)
+          ? new mongoose.Types.ObjectId(answeredCategoryId)
+          : null;
+
+        let session = null;
+        if (sessionId && mongoose.Types.ObjectId.isValid(sessionId)) {
+          session = await ChatSession.findById(sessionId);
+        }
+
+        if (!session) {
+          session = new ChatSession({
+            userId: userObjectId,
+            categoryId: categoryObjectId,
+            title: String(question || '').trim().slice(0, 18) || '新的对话',
+            lastQuestion: String(question || ''),
+            lastAnswer: noMatchAnswer,
+            messageCount: 0,
+            history: []
+          });
+        }
+
+        session.userId = session.userId || userObjectId;
+        session.categoryId = session.categoryId || categoryObjectId;
+        session.title = session.title || String(question || '').trim().slice(0, 18) || '新的对话';
+        session.lastQuestion = String(question || '');
+        session.lastAnswer = noMatchAnswer;
+        session.history = [
+          { role: 'user', content: String(question || ''), sources: [] },
+          { role: 'assistant', content: noMatchAnswer, sources: [] }
+        ];
+        session.messageCount = session.history.length;
+        await session.save();
+        console.log('[QA] 对话历史已记录', String(session._id));
+      } catch (historyError) {
+        console.error('[QA] 记录对话历史失败:', historyError);
+      }
+
+      sendSSE(res, 'done', {
+        answer: noMatchAnswer,
+        sessionId: finalSessionId,
+        sources: [],
+        recommendedKnowledge,
+        suggestedKnowledge: suggestedCategory?.name || '',
+        suggestedKnowledgeId: suggestedCategory?.id || ''
+      });
+      res.end();
+      return;
+    }
+
     try {
       console.log('[QA] 开始流式调用大模型...');
       fullAnswer = await generateAnswerStream(prompt, (chunk) => {
@@ -503,14 +633,56 @@ router.post('/ask', async (req, res) => {
       fullAnswer = '';
     }
 
+    // 当前知识库召回到了内容，但 LLM 实际无法回答时，仍要去其他知识库找推荐，
+    // 避免出现“答不出内容却没有给出任何切换建议”的情况。
+    const answeredUncertain = !String(fullAnswer || '').trim()
+      || NON_ANSWER_MARKERS.some((marker) => String(fullAnswer || '').includes(marker));
+    if (categoryId && answeredUncertain && !suggestedCategory) {
+      const alt = await findAlternativeRecommendation(question.trim(), categoryId, allDocs, categoriesById, questionEmbedding);
+      recommendedKnowledge = alt.recommendedKnowledge;
+      suggestedCategory = alt.suggestedCategory;
+
+      if (suggestedCategory && suggestedCategory.score >= RECOMMENDATION_MIN_SCORE) {
+        sendSSE(res, 'mismatch', {
+          message: '当前知识库没有找到答案，已为你推荐更相关的知识库。',
+          suggestedKnowledge: suggestedCategory.name,
+          suggestedKnowledgeId: suggestedCategory.id,
+          recommendedKnowledge,
+          currentCategoryScore,
+          suggestedCategoryScore: suggestedCategory.score,
+          currentCategoryName: currentCategory || '',
+          topMatchedDocument: '',
+          isHighlyRelevant: false,
+          scoreGap: Number((suggestedCategory.score - currentCategoryScore).toFixed(2)),
+          shouldForceSwitch: false
+        });
+      } else {
+        recommendedKnowledge = [];
+        suggestedCategory = null;
+        sendSSE(res, 'mismatch', {
+          message: `当前知识库「${currentCategory || '未命名'}」没有相关内容。`,
+          suggestedKnowledge: '',
+          suggestedKnowledgeId: '',
+          recommendedKnowledge: [],
+          currentCategoryScore,
+          suggestedCategoryScore: 0,
+          currentCategoryName: currentCategory || '',
+          topMatchedDocument: '',
+          isHighlyRelevant: false,
+          scoreGap: 0,
+          shouldForceSwitch: false
+        });
+      }
+    }
+
     const responseTime = Date.now() - startTime;
     try {
       await QALog.create({
         question: question.trim(),
         answer: fullAnswer || '根据当前知识库内容暂时无法确定。',
-        categoryId: categoryId || null,
-        categoryName,
-        userId: req.headers['x-user-id'] || null,
+        categoryId: answeredCategoryId,
+        categoryName: answeredCategoryName,
+        userId: getRequestUser(req).userId || null,
         sources: sources.map((s) => s.title),
         sessionId: finalSessionId,
         responseTime,
@@ -523,11 +695,12 @@ router.post('/ask', async (req, res) => {
     }
 
     try {
-      const userObjectId = req.headers['x-user-id'] && mongoose.Types.ObjectId.isValid(req.headers['x-user-id'])
-        ? new mongoose.Types.ObjectId(req.headers['x-user-id'])
+      const userId = getRequestUser(req).userId;
+      const userObjectId = userId && mongoose.Types.ObjectId.isValid(userId)
+        ? new mongoose.Types.ObjectId(userId)
         : null;
-      const categoryObjectId = categoryId && mongoose.Types.ObjectId.isValid(categoryId)
-        ? new mongoose.Types.ObjectId(categoryId)
+      const categoryObjectId = answeredCategoryId && mongoose.Types.ObjectId.isValid(answeredCategoryId)
+        ? new mongoose.Types.ObjectId(answeredCategoryId)
         : null;
 
       let session = null;
@@ -568,8 +741,10 @@ router.post('/ask', async (req, res) => {
       sessionId: finalSessionId,
       sources,
       recommendedKnowledge,
-      suggestedKnowledge: suggestedCategory?.name || '',
-      suggestedKnowledgeId: suggestedCategory?.id || ''
+      suggestedKnowledge: autoSwitched ? routedCategoryName : (suggestedCategory?.name || ''),
+      suggestedKnowledgeId: autoSwitched ? routedCategoryId : (suggestedCategory?.id || ''),
+      answeredByKnowledgeId: autoSwitched ? routedCategoryId : (categoryId || null),
+      answeredByKnowledge: autoSwitched ? routedCategoryName : categoryName
     });
     
     res.end();
@@ -583,7 +758,7 @@ router.post('/ask', async (req, res) => {
         answer: '',
         categoryId: req.body.categoryId || null,
         categoryName: '',
-        userId: req.headers['x-user-id'] || null,
+        userId: getRequestUser(req).userId || null,
         sources: [],
         sessionId: req.body.sessionId || '',
         responseTime,

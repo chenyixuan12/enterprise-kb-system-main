@@ -14,6 +14,10 @@ export const config = {
   mongodbUri: process.env.MONGODB_URI || 'mongodb://localhost:27017/db_enterprise_qa',
   mongodbConnectTimeout: Number(process.env.MONGODB_CONNECT_TIMEOUT || 30000),
 
+  // JWT 签名鉴权
+  jwtSecret: process.env.JWT_SECRET || '',
+  jwtExpiresIn: process.env.JWT_EXPIRES_IN || '7d',
+
   chromaBaseUrl: process.env.CHROMA_BASE_URL || 'http://127.0.0.1:8000',
   chromaTenant: process.env.CHROMA_TENANT || 'default_tenant',
   chromaDatabase: process.env.CHROMA_DATABASE || 'default_database',

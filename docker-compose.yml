@@ -2,12 +2,25 @@ services:
   mongo:
     image: mongo:7
     container_name: enterprise-mongo
-    ports:
-      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME:-kbadmin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD:-kbadmin123}
+    # 数据库仅在内网使用，不映射公网端口；如需本机调试可改为 "127.0.0.1:27017:27017"
     volumes:
       - mongo-data:/data/db
     healthcheck:
-      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      test:
+        - CMD
+        - mongosh
+        - --quiet
+        - --username
+        - ${MONGO_INITDB_ROOT_USERNAME:-kbadmin}
+        - --password
+        - ${MONGO_INITDB_ROOT_PASSWORD:-kbadmin123}
+        - --authenticationDatabase
+        - admin
+        - --eval
+        - "db.adminCommand('ping').ok"
       interval: 10s
       timeout: 5s
       retries: 5
@@ -19,8 +32,9 @@ services:
     container_name: enterprise-ollama
     environment:
       OLLAMA_KEEP_ALIVE: "24h"
+    # 仅绑定本机回环地址，不对公网开放
     ports:
-      - "11434:11434"
+      - "127.0.0.1:11434:11434"
     volumes:
       - ollama-data:/root/.ollama
     healthcheck:
@@ -34,8 +48,9 @@ services:
   chroma:
     image: chromadb/chroma:latest
     container_name: enterprise-chroma
+    # 仅绑定本机回环地址，不对公网开放
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     volumes:
       - chroma-data:/chroma/chroma
     healthcheck:
@@ -59,12 +74,13 @@ services:
       - .env
     environment:
       NODE_ENV: production
-      MONGODB_URI: mongodb://mongo:27017/db_enterprise_qa
+      MONGODB_URI: mongodb://${MONGO_INITDB_ROOT_USERNAME:-kbadmin}:${MONGO_INITDB_ROOT_PASSWORD:-kbadmin123}@mongo:27017/db_enterprise_qa?authSource=admin
       CHROMA_BASE_URL: http://chroma:8000
       EMBEDDING_BASE_URL: http://ollama:11434
       UPLOAD_FILE_DIR: /app/uploads
+    # 仅绑定本机回环地址，公网访问统一走前端 Nginx
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     volumes:
       - ./backend/uploads:/app/uploads
     depends_on:
@@ -91,6 +107,7 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     container_name: enterprise-frontend
+    # 唯一对外暴露的端口
     ports:
       - "80:80"
     depends_on:

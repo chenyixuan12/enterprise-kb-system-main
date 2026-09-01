@@ -9,7 +9,7 @@ import KnowledgeDB from '../views/KnowledgeDB.vue';
 import DashBoard from '../views/DashBoard.vue';
 import UsersView from '../views/Users.vue';
 import ChatHistoryView from '../views/ChatHistoryView.vue';
-
+import { clearAuth, getStoredUser } from '../utils/auth.js';
 
 const routes = [
   { path: '/', component: LoginView },
@@ -46,8 +46,11 @@ const router = createRouter({
 });
 
 router.beforeEach((to) => {
-  const user = localStorage.getItem('enterpriseUser');
-  if (!user && to.path !== '/') return '/';
+  const user = getStoredUser();
+  if (!user && to.path !== '/') {
+    clearAuth();
+    return '/';
+  }
   return true;
 });
 

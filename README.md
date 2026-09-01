@@ -1,5 +1,5 @@
 # Enterprise AIKB
-# 当前版本：V1 — Naive RAG 主链路 + 轻量级 Hybrid Search + 规则 Reranking。
+# 当前版本：V2 — 完整 RAG 主链路 + BM25/向量混合检索（RRF 融合）+ 跨知识库自动路由。
 企业内部知识库智能问答系统。项目基于 RAG（检索增强生成）实现企业制度、产品指南等文档的可追溯问答，支持文档上传、语义切块、本地向量化、Chroma 检索、流式回答与引用来源展示。
 
 
@@ -10,11 +10,11 @@
 - **文档解析**：支持 `txt`、`md`、`pdf`、`docx` 文件上传，以及手动录入富文本内容。
 - **自动索引**：文档入库后自动解析、按自然语义边界切块、生成 embedding 并写入向量库。
 - **RAG 问答**：按当前选择的知识库召回相关 Chunk，将上下文交给大模型生成答案。
-- **轻量混合检索**：向量召回结合标题/正文关键词规则重排，降低跨主题误召回。
+- **混合检索（BM25 + 向量 + RRF）**：Chroma 稠密向量与 BM25 稀疏检索双路召回，RRF 融合排序，降低跨主题误召回。
 - **来源追溯**：回答下方展示命中文档、文本片段与相关度。
 - **流式输出**：通过 SSE 将大模型回答实时推送到前端。
 - **会话与日志**：保存对话历史、问答日志与回答来源。
-- **知识库推荐**：当前库相关性低时提供候选知识库切换建议。
+- **跨知识库自动路由**：当前知识库无可靠答案时，自动检索最相关的其他知识库并直接回答，无需手动切换。
 - **AI 补全**：编辑知识内容时可调用大模型辅助补全文本。
 
 ## RAG 架构
@@ -39,16 +39,19 @@ Chroma：保存 Chunk 向量、文本与来源元数据
 用户提问
         │
         ▼
-问题 Embedding
+问题 Embedding + BM25 分词
         │
-        ▼
-Chroma TopK Chunk 检索（按 knowledge category 过滤）
-        │
-        ▼
-标题/正文关键词轻量重排（Reranking）
-        │
-        ▼
-问题 + 上下文 → LLM 流式生成 → 来源片段展示
+        ├── Chroma 稠密向量召回（按 knowledge category 过滤）
+        └── MongoDB Chunk BM25 稀疏召回
+                │
+                ▼
+        RRF 融合排序 → TopK Chunk
+                │
+                ▼
+        答案证据判断（无可靠答案时自动路由到其他知识库重新召回）
+                │
+                ▼
+        问题 + 上下文 → LLM 流式生成 → 来源片段展示
 ```
 
 ## 技术栈
@@ -89,6 +92,7 @@ enterprise-kb-system-main/
 │     │  ├─ documentService.js       # 文本提取与语义切块
 │     │  ├─ knowledgeIndexService.js # 文档索引管线
 │     │  ├─ chromaService.js         # Chroma 向量读写
+│     │  ├─ bm25Service.js           # BM25 稀疏检索 + RRF 融合
 │     │  └─ ollamaService.js         # Embedding / LLM 调用
 │     └─ utils/
 ├─ chroma-data/                      # 本地 Chroma 数据目录（运行后生成）
@@ -96,6 +100,8 @@ enterprise-kb-system-main/
 ```
 
 ## 本地运行
+
+> 若不想手动安装 Node / MongoDB / Ollama / Chroma，可直接使用 Docker 一键部署，见「[Docker 部署](#docker-部署)」。
 
 ### 1. 准备环境
 
@@ -224,6 +230,122 @@ npm install
 npm run dev
 ```
 
+## Docker 部署
+
+项目提供 `docker-compose.yml`，一键编排全部服务（MongoDB、Ollama、Chroma、后端、前端），无需本机安装 Node / Python / MongoDB 等运行时。
+
+### 1. 环境要求
+
+- 已安装 Docker Engine（20.10+）与 Docker Compose v2（`docker compose version` 可验证）。
+- 首次构建需要能够访问 npm registry 与 Docker Hub 的网络。
+- 建议至少 4GB 可用内存（Ollama 推理 + Chroma 向量库）。
+
+### 2. 配置环境变量
+
+复制根目录 `.env.example` 为 `.env`，填写真实配置：
+
+```powershell
+Copy-Item .env.example .env
+```
+
+打开 `.env`，重点填写以下项：
+
+```env
+# DeepSeek API Key（必填，用于回答生成）
+LLM_API_KEY=your_api_key_here
+LLM_BASE_URL=https://api.deepseek.com
+LLM_MODEL_NAME=deepseek-v4-pro
+
+# MongoDB 管理员账号（必填，上线前务必改成强密码，避免默认值）
+MONGO_INITDB_ROOT_USERNAME=kbadmin
+MONGO_INITDB_ROOT_PASSWORD=kbadmin123
+
+# JWT 签名密钥（必填，上线前务必改成足够长的随机字符串）
+JWT_SECRET=please_change_me_to_a_long_random_string
+
+# 本地 Ollama Embedding（Docker 内无需修改地址，compose 会自动替换为容器地址）
+EMBEDDING_MODEL_NAME=nomic-embed-text
+```
+
+> 密码中不要包含 `@`、`:`、`/`、`?` 等 URL 特殊字符，否则 MongoDB 连接串会解析失败。
+>
+> `docker-compose.yml` 中的 `environment` 会覆盖 `.env` 里的容器内连接地址（如 `MONGODB_URI`、`CHROMA_BASE_URL`、`EMBEDDING_BASE_URL`），因此 `.env` 中这些项保持默认即可。
+
+### 3. 构建并启动
+
+在项目根目录执行：
+
+```powershell
+docker compose up -d --build
+```
+
+启动后依次等待 MongoDB、Ollama、Chroma 健康检查通过，再启动后端与前端。查看状态：
+
+```powershell
+docker compose ps
+```
+
+所有服务均变为 `healthy` 后即可访问：
+
+- 前端页面：<http://localhost>
+- 后端 API：<http://localhost:3000/health>（返回 `OK` 即正常）
+
+### 4. 拉取 Embedding 模型（首次必须）
+
+进入 Ollama 容器拉取 embedding 模型，否则文档索引与问答检索会失败：
+
+```powershell
+docker compose exec ollama ollama pull nomic-embed-text
+```
+
+验证模型已就绪：
+
+```powershell
+docker compose exec ollama ollama list
+```
+
+### 5. 初始化种子数据（可选）
+
+如需预置默认分类与管理员账号，可执行：
+
+```powershell
+docker compose exec backend npm run seed
+```
+
+默认管理员密码由 `.env` 中 `DEFAULT_USER_PASSWORD` 指定。
+
+### 6. 常用运维命令
+
+| 操作 | 命令 |
+| --- | --- |
+| 查看所有服务状态 | `docker compose ps` |
+| 查看后端日志 | `docker compose logs -f backend` |
+| 查看前端日志 | `docker compose logs -f frontend` |
+| 重启单个服务 | `docker compose restart backend` |
+| 更新代码后重新构建 | `docker compose up -d --build` |
+| 停止全部服务 | `docker compose down` |
+| 停止并清空数据卷（谨慎，会删除全部数据） | `docker compose down -v` |
+
+### 7. 端口与数据持久化
+
+| 服务 | 容器名 | 对外端口 | 说明 |
+| --- | --- | --- | --- |
+| 前端（nginx） | `enterprise-frontend` | `80`（唯一对外暴露） | 公网访问入口 |
+| 后端（Node） | `enterprise-backend` | `127.0.0.1:3000` | 仅本机可访问，用于调试 |
+| MongoDB | `enterprise-mongo` | 不映射 | 仅容器内网，已启用账号密码认证 |
+| Ollama | `enterprise-ollama` | `127.0.0.1:11434` | 仅本机可访问 |
+| Chroma | `enterprise-chroma` | `127.0.0.1:8000` | 仅本机可访问 |
+
+数据卷由 Docker 持久化管理，`docker compose down` 不会删除数据；如需彻底清理使用 `docker compose down -v`。
+
+### 8. 注意事项
+
+- `.env` 中的 `LLM_API_KEY`、`MONGO_INITDB_ROOT_PASSWORD`、`JWT_SECRET` 属于敏感信息，请勿提交到 Git。
+- 上线公网前务必修改默认的 `MONGO_INITDB_ROOT_PASSWORD`、`JWT_SECRET` 和管理员账号密码，并确认服务器防火墙只放行 80 端口。
+- 更换 `EMBEDDING_MODEL_NAME` 后，旧向量不能混用，需清理 Chroma 数据卷并对所有文档重新索引。
+- 首次 `docker compose up -d` 需要拉取多个基础镜像并构建前端，耗时较长属正常现象。
+- 若前端部署在服务器上需改端口，修改 `docker-compose.yml` 中 `frontend.ports` 的宿主端口映射（如 `8080:80`）。
+
 ## 使用流程
 
 1. 进入知识库管理页面，创建或选择知识库分类。
@@ -234,18 +356,19 @@ npm run dev
 
 ## 当前版本的 RAG 定位
 
-当前项目不是只包含“向量检索 + LLM”的纯 Naive RAG，而是：
+当前项目已实现完整的 Naive RAG 主链路，并在此基础上加入了：
 
 ```text
-Naive RAG + 分类过滤 + 轻量 Hybrid Search + 规则型 Reranking
+分类过滤 + Chroma 稠密检索 + BM25 稀疏检索 + RRF 融合 + 答案证据判断 + 跨知识库自动路由
 ```
 
-当前版本适合标准文本知识库问答场景。后续可按实际问题逐步演进：
+当前版本定位为 **V2（跨知识库自动路由 / Adaptive RAG 雏形）**，适合标准文本知识库问答场景。后续可按实际问题逐步演进：
 
-- **V2：跨知识库 Router / Adaptive RAG**：通过全局 Chunk 检索与知识库聚合评分，提高知识库切换建议准确性。
-- **V3：Multi-Query RAG / Query Rewrite / HyDE**：改善口语化、同义词和不完整问题的召回能力。
-- **V4：独立 Reranker + Corrective RAG**：加入 Cross-Encoder 重排、相关性校验和低置信度重检索，降低错误召回与幻觉。
-- **V5：多模态、GraphRAG 或 Agentic RAG**：根据图表、跨文档推理和多数据源需求选择性扩展。
+- **V1 ✅ 已完成**：Naive RAG 主链路 + 文档解析/切块/向量化 + 混合检索 + 流式回答与来源追溯。
+- **V2 ✅ 已实现自动路由**：当前知识库无可靠答案时，自动检索最相关的其他知识库并直接回答（保留跨知识库聚合评分与切换建议）。
+- **V3（未做）**：Multi-Query RAG / Query Rewrite / HyDE，改善口语化、同义词和不完整问题的召回能力。
+- **V4（部分雏形）**：独立 Reranker + Corrective RAG，已加入答案证据判断与无答案兜底，尚未加入 Cross-Encoder 重排与低置信度重检索。
+- **V5（未做）**：多模态、GraphRAG 或 Agentic RAG。
 
 ## 常用脚本
 

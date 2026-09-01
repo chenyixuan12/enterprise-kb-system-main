@@ -86,7 +86,7 @@
               </div>
             </div>
 
-            <div v-if="topRecommendedKb" class="recommend-area">
+            <!-- <div v-if="topRecommendedKb" class="recommend-area">
               <div class="recommend-card">
                 <div class="recommend-label">推荐知识库</div>
                 <div class="recommend-name">{{ topRecommendedKb.name }}</div>
@@ -104,7 +104,7 @@
               >
                 切换
               </el-button>
-            </div>
+            </div> -->
           </section>
         </transition>
 
@@ -187,8 +187,6 @@ import { Menu, FolderOpened, Search, ChatDotSquare, Monitor, ArrowRight, Plus, W
 import ChatMessage from '../components/ChatMessage.vue';
 import { apiFetch, apiFetchStream } from '../api/http.js';
 
-const SESSION_STORAGE_KEY = 'qa-session-state';
-
 const question = ref('');
 const messages = ref([]);
 const asking = ref(false);
@@ -205,35 +203,6 @@ const topRecommendedKb = ref(null);
 const route = useRoute();
 const lastQuestion = ref('');
 
-function saveSessionState() {
-  if (!selectedKnowledgeDB.value) return;
-  const state = {
-    categoryId: selectedKnowledgeDB.value._id,
-    categoryName: selectedKnowledgeDB.value.name,
-    messages: messages.value,
-    sessionId: sessionId.value,
-    lastActiveTime: Date.now()
-  };
-  localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(state));
-}
-
-function restoreSessionState() {
-  try {
-    const stateStr = localStorage.getItem(SESSION_STORAGE_KEY);
-    if (!stateStr) return null;
-    const state = JSON.parse(stateStr);
-    if (state.categoryId && state.messages && state.messages.length > 0) return state;
-    return null;
-  } catch (error) {
-    console.error('恢复会话状态失败:', error);
-    return null;
-  }
-}
-
-function clearSavedSessionState() {
-  localStorage.removeItem(SESSION_STORAGE_KEY);
-}
-
 function createNewSession() {
   messages.value = [];
   sessionId.value = '';
@@ -243,7 +212,6 @@ function createNewSession() {
   recommendedKbs.value = [];
   topRecommendedKb.value = null;
   question.value = '';
-  clearSavedSessionState();
 }
 
 function getSessionStorageKey(categoryId) {
@@ -326,9 +294,6 @@ async function loadSessionHistory(sessionIdParam) {
 }
 
 function selectKnowledgeDB(item) {
-  if (selectedKnowledgeDB.value && messages.value.length > 0) {
-    saveSessionState();
-  }
   selectedKnowledgeDB.value = item;
   clearCurrentChatState();
   sessionId.value = restoreSessionId(item._id);
@@ -377,6 +342,20 @@ async function sendQuestion() {
       },
       onMismatch(data) {
         mismatchHint.value = data || null;
+
+        const matchedKnowledgeId = data?.answeredByKnowledgeId || data?.suggestedKnowledgeId;
+        if (data?.autoSwitched && matchedKnowledgeId) {
+          const matchedKnowledge = knowledgeDBs.value.find(
+            (item) => String(item._id) === String(matchedKnowledgeId)
+          );
+          if (matchedKnowledge) {
+            selectedKnowledgeDB.value = matchedKnowledge;
+          }
+          recommendedKbs.value = [];
+          topRecommendedKb.value = null;
+          return;
+        }
+
         const recs = Array.isArray(data?.recommendedKnowledge) ? data.recommendedKnowledge : [];
         recommendedKbs.value = recs;
         topRecommendedKb.value = recs[0] || null;
@@ -457,10 +436,6 @@ watch(selectedKnowledgeDB, (val) => {
   if (val?._id) sessionId.value = restoreSessionId(val._id);
 });
 
-watch(messages, () => {
-  if (messages.value.length > 0) saveSessionState();
-}, { deep: true });
-
 onMounted(async () => {
   await loadKnowledgeDBs();
 
@@ -474,18 +449,6 @@ onMounted(async () => {
       await loadSessionHistory(urlSessionId);
       persistSessionId(urlSessionId);
       return;
-    }
-  }
-
-  const savedState = restoreSessionState();
-  if (savedState) {
-    const kb = knowledgeDBs.value.find((item) => item._id === savedState.categoryId);
-    if (kb) {
-      selectedKnowledgeDB.value = kb;
-      messages.value = savedState.messages || [];
-      sessionId.value = savedState.sessionId || '';
-      question.value = lastQuestion.value || '';
-      scrollToBottom();
     }
   }
 });

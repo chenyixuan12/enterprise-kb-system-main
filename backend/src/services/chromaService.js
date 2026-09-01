@@ -55,6 +55,13 @@ export async function getOrCreateCollection() {
   }
 }
 
+// 删除整个 collection（v2 API 按名称寻址）。用于更换 embedding 模型后重建索引。
+export async function deleteCollection(collectionName) {
+  const client = getClient();
+  const name = collectionName || config.chromaCollection || DEFAULT_COLLECTION_NAME;
+  await client.delete(`${getCollectionPath()}/${encodeURIComponent(name)}`);
+}
+
 export async function upsertChunks(chunks) {
   if (!Array.isArray(chunks) || chunks.length === 0) return;
 

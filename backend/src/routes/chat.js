@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import mongoose from 'mongoose';
 import ChatSession from '../models/ChatSession.js';
-import { requireRole, getRequestUser } from '../utils/auth.js';
+import { requireRole, getRequestUser, isAdmin } from '../utils/auth.js';
 
 const router = Router();
 
@@ -10,6 +10,12 @@ function toObjectId(value) {
   if (value instanceof mongoose.Types.ObjectId) return value;
   if (!mongoose.Types.ObjectId.isValid(value)) return null;
   return new mongoose.Types.ObjectId(value);
+}
+
+function canAccessSession(req, session) {
+  if (isAdmin(req)) return true;
+  const currentUser = getRequestUser(req);
+  return Boolean(session?.userId && currentUser.userId && String(session.userId) === String(currentUser.userId));
 }
 
 function summarizeTitle(question = '') {
@@ -103,11 +109,14 @@ router.get('/', async (req, res) => {
  *       500:
  *         description: 服务器错误
  */
-// 会话详情
+// 会话详情：仅会话所有者或管理员可查看
 router.get('/:id', async (req, res) => {
   try {
     const session = await ChatSession.findById(req.params.id).lean();
     if (!session) return res.status(404).json({ message: '会话不存在' });
+    if (!canAccessSession(req, session)) {
+      return res.status(403).json({ message: '无权限访问该会话' });
+    }
     res.json({ data: session });
   } catch (error) {
     res.status(500).json({ message: '获取会话详情失败', error: error.message });
@@ -133,11 +142,15 @@ router.get('/:id', async (req, res) => {
  *       500:
  *         description: 服务器错误
  */
-// 删除会话
+// 删除会话：仅会话所有者或管理员可删除
 router.delete('/:id', async (req, res) => {
   try {
-    const session = await ChatSession.findByIdAndDelete(req.params.id);
+    const session = await ChatSession.findById(req.params.id).lean();
     if (!session) return res.status(404).json({ message: '会话不存在' });
+    if (!canAccessSession(req, session)) {
+      return res.status(403).json({ message: '无权限删除该会话' });
+    }
+    await ChatSession.findByIdAndDelete(req.params.id);
     res.json({ message: '删除成功', data: session });
   } catch (error) {
     res.status(500).json({ message: '删除失败', error: error.message });
@@ -185,6 +198,9 @@ router.post('/save', async (req, res) => {
     let session;
     if (sessionId && mongoose.Types.ObjectId.isValid(sessionId)) {
       session = await ChatSession.findById(sessionId);
+      if (session && !canAccessSession(req, session)) {
+        return res.status(403).json({ message: '无权限修改该会话' });
+      }
     }
 
     if (!session) {

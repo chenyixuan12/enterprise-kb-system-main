@@ -3,8 +3,11 @@ import User from '../models/User.js';
 import KnowledgeDocument from '../models/KnowledgeDocument.js';
 import KnowledgeCategory from '../models/knowledgeCategory.js';
 import QALog from '../models/QALog.js';
+import { requireRole } from '../utils/auth.js';
 
 const router = Router();
+
+router.use(requireRole('admin'));
 
 /**
  * @openapi

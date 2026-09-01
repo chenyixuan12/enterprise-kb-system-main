@@ -4,6 +4,7 @@
       <div class="bg-orb orb-1"></div>
       <div class="bg-orb orb-2"></div>
       <div class="bg-grid"></div>
+      <ConstellationBackground />
     </div>
 
     <div class="login-shell">
@@ -72,12 +73,12 @@
 
         <div class="hint-box">
           <div>
-            <span class="hint-label">测试账号</span>
-            <span>admin / 123456</span>
+            <span class="hint-label">温馨提示</span>
+            <span>请联系管理员获取账号</span>
           </div>
           <div>
-            <span class="hint-label">普通用户</span>
-            <span>user1 / 123456</span>
+            <span class="hint-label">登录安全</span>
+            <span>凭证已加密传输，请勿泄露</span>
           </div>
         </div>
       </div>
@@ -89,13 +90,15 @@
 import { reactive, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import { apiFetch } from '../api/http.js';
+import ConstellationBackground from '../components/ConstellationBackground.vue';
+import { setAuth } from '../utils/auth.js';
 
 const router = useRouter();
 const loading = ref(false);
 const error = ref('');
 const form = reactive({
-  username: 'admin',
-  password: '123456'
+  username: '',
+  password: ''
 });
 
 function clearQaSessionState() {
@@ -120,7 +123,10 @@ async function login() {
     });
 
     clearQaSessionState();
-    localStorage.setItem('enterpriseUser', JSON.stringify(result.data));
+    setAuth(result.data, {
+      accessToken: result.data.accessToken,
+      refreshToken: result.data.refreshToken
+    });
     const redirectPath = result.data.role === 'admin' ? '/backend/dashboard' : '/backend/qa';
     router.push(redirectPath);
   } catch (err) {

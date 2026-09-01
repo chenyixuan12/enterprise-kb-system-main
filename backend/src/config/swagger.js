@@ -162,7 +162,7 @@ const options = {
           required: ['username', 'password'],
           properties: {
             username: { type: 'string', example: 'admin' },
-            password: { type: 'string', example: '123456' }
+            password: { type: 'string', example: 'your_password' }
           }
         },
         LoginResponse: {

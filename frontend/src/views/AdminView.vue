@@ -85,9 +85,10 @@ import { computed, onMounted, reactive, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import * as echarts from 'echarts';
 import { apiFetch } from '../api/http.js';
+import { clearAuth, getStoredUser } from '../utils/auth.js';
 
 const router = useRouter();
-const currentUser = ref(JSON.parse(localStorage.getItem('enterpriseUser') || '{}'));
+const currentUser = ref(getStoredUser() || {});
 const avatarText = computed(() => (currentUser.value.nickname || currentUser.value.username || '系')[0]);
 const dashboard = reactive({ userCount: 0, adminCount: 0, docCount: 0, processedCount: 0, docStatus: [], userRoleStats: [] });
 const userChart = ref(null);
@@ -96,7 +97,7 @@ const docChart = ref(null);
 function goQa() { router.push('/qa'); }
 function goUpload() { router.push('/upload'); }
 function goDoc() { router.push('/documents'); }
-function logout() { localStorage.removeItem('enterpriseUser'); router.push('/'); }
+function logout() { clearAuth(); router.push('/'); }
 
 onMounted(async () => {
   const result = await apiFetch('/admin/dashboard');

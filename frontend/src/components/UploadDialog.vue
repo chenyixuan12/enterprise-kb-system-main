@@ -227,7 +227,7 @@ async function uploadInChunks(file) {
   progress.value = 96;
   const result = (await http.post('/knowledge/upload/merge', { fileHash, fileName: file.name, fileSize: file.size, totalChunks, categoryId: form.categoryId })).data;
   progress.value = 100;
-  uploadStatus.value = '上传完成';
+  uploadStatus.value = '上传完成，正在后台建立索引';
   return result;
 }
 </script>

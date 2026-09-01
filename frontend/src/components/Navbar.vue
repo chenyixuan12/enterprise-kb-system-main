@@ -27,9 +27,10 @@
 import { ArrowDown, Fold, Expand, SwitchButton } from '@element-plus/icons-vue';
 import { useRouter } from 'vue-router'
 import { computed, ref, inject } from 'vue'
+import { clearAuth, getStoredUser } from '../utils/auth.js'
 
 const router = useRouter()
-const currentUser = ref(JSON.parse(localStorage.getItem('enterpriseUser') || '{}'))
+const currentUser = ref(getStoredUser() || {})
 
 const avatarText = computed(() => (currentUser.value.nickname || currentUser.value.username || '系')[0])
 
@@ -39,7 +40,7 @@ const collapsed = inject('sidebarCollapsed', ref(false))
 const emit = defineEmits(['toggle-sidebar'])
 
 const handleLogout = () => {
-  localStorage.removeItem('enterpriseUser')
+  clearAuth()
   router.push('/')
 }
 

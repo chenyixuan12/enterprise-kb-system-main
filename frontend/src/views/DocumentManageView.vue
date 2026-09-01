@@ -24,7 +24,8 @@
       />
       <el-select v-model="status" placeholder="选择状态筛选" clearable style="width: 180px">
         <el-option label="全部" value="" />
-        <el-option label="待处理" value="pending" />
+        <el-option label="等待索引" value="pending" />
+        <el-option label="索引中" value="processing" />
         <el-option label="已处理" value="processed" />
         <el-option label="失败" value="failed" />
       </el-select>
@@ -68,7 +69,14 @@
         </el-table-column>
         <el-table-column label="状态" width="120">
           <template #default="{ row }">
-            <el-tag :type="statusTagType(row.status)">{{ statusText(row.status) }}</el-tag>
+            <el-tooltip
+              v-if="row.status === 'failed' && row.errorMessage"
+              :content="row.errorMessage"
+              placement="top"
+            >
+              <el-tag :type="statusTagType(row.status)">{{ statusText(row.status) }}</el-tag>
+            </el-tooltip>
+            <el-tag v-else :type="statusTagType(row.status)">{{ statusText(row.status) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="上传时间" width="180">
@@ -77,6 +85,7 @@
         <el-table-column label="操作" width="180" fixed="right">
           <template #default="{ row }">
             <el-button type="primary" link @click="openPreview(row)">预览</el-button>
+            <el-button v-if="row.status === 'failed'" type="warning" link :loading="retryingId === row._id" @click="handleRetry(row)">重试</el-button>
             <el-button type="danger" link @click="handleDelete(row)">删除</el-button>
           </template>
         </el-table-column>
@@ -138,6 +147,8 @@ const manualDialogVisible = ref(false);
 const knowledgeDBs = ref([]);
 const previewDialogVisible = ref(false);
 const previewDoc = ref(null);
+const retryingId = ref(null);
+const pollTimer = ref(null);
 
 function extIcon(type) {
   const map = { txt: 'TXT', pdf: 'PDF', doc: 'DOC', docx: 'DOC', md: 'MD' };
@@ -145,13 +156,32 @@ function extIcon(type) {
 }
 
 function statusText(statusValue) {
-  const map = { pending: '待处理', processed: '已处理', failed: '失败' };
-  return map[statusValue] || '待处理';
+  const map = { pending: '等待索引', processing: '索引中', processed: '已处理', failed: '失败' };
+  return map[statusValue] || '等待索引';
 }
 
 function statusTagType(statusValue) {
-  const map = { pending: 'warning', processed: 'success', failed: 'danger' };
+  const map = { pending: 'warning', processing: 'primary', processed: 'success', failed: 'danger' };
   return map[statusValue] || 'warning';
+}
+
+function hasPendingDocs() {
+  return docs.value.some((item) => item.status === 'pending' || item.status === 'processing');
+}
+
+function stopPolling() {
+  if (pollTimer.value) {
+    clearInterval(pollTimer.value);
+    pollTimer.value = null;
+  }
+}
+
+function ensurePolling() {
+  stopPolling();
+  if (!hasPendingDocs()) return;
+  pollTimer.value = window.setInterval(() => {
+    reload();
+  }, 2000);
 }
 
 function formatDate(value) {
@@ -209,6 +239,19 @@ async function handleDelete(row) {
   }
 }
 
+async function handleRetry(row) {
+  try {
+    retryingId.value = row._id;
+    await http.post(`/knowledge/${row._id}/retry`);
+    ElMessage.success('已重新加入索引队列');
+    await reload();
+  } catch (error) {
+    ElMessage.error(error.message || '重试失败');
+  } finally {
+    retryingId.value = null;
+  }
+}
+
 const filteredDocs = computed(() => {
   const kw = keyword.value.trim().toLowerCase();
   return docs.value.filter((item) => {
@@ -237,8 +280,8 @@ function handleReset() {
 async function reload() {
   try {
     const response = await http.get('/knowledge');
-    console.log('[DocumentManageView] reload success', response);
     docs.value = response.data?.data || [];
+    ensurePolling();
   } catch (error) {
     console.error('加载文档列表失败', error);
   }
@@ -255,6 +298,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  stopPolling();
   window.removeEventListener('document-uploaded', onDocumentUploaded);
 });
 </script>

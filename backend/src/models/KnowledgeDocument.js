@@ -19,7 +19,8 @@ const knowledgeDocumentSchema = new mongoose.Schema(
     uploadedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     chunkCount: { type: Number, default: 0 },
     content: { type: String, default: '' },
-    status: { type: String, enum: ['pending', 'processed', 'failed'], default: 'pending' },
+    status: { type: String, enum: ['pending', 'processing', 'processed', 'failed'], default: 'pending' },
+    errorMessage: { type: String, default: '' },
     vectorIds: { type: [String], default: [] }
   },
   { timestamps: true }

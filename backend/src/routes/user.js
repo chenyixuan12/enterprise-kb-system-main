@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import User from '../models/User.js';
+import { config } from '../config/env.js';
 import { requireRole } from '../utils/auth.js';
 
 const router = Router();
@@ -151,10 +152,10 @@ router.get('/:id', requireRole('admin'), async (req, res) => {
  *       500:
  *         description: 服务器错误
  */
-// 新增用户：默认密码统一为 123456
+// 新增用户：默认密码取环境变量 DEFAULT_USER_PASSWORD
 router.post('/', requireRole('admin'), async (req, res) => {
   try {
-    const { username, password = '123456', role = 'user', nickname = '', status = 'active' } = req.body || {};
+    const { username, password = config.defaultUserPassword, role = 'user', nickname = '', status = 'active' } = req.body || {};
 
     if (!username?.trim()) {
       return res.status(400).json({ message: '用户名不能为空' });
@@ -313,10 +314,10 @@ router.delete('/:id', requireRole('admin'), async (req, res) => {
  *       500:
  *         description: 服务器错误
  */
-// 重置密码：仅管理员可操作，默认重置为 123456
+// 重置密码：仅管理员可操作，重置为环境变量 DEFAULT_USER_PASSWORD 指定的密码
 router.patch('/:id/reset-password', requireRole('admin'), async (req, res) => {
   try {
-    const hashedPassword = await User.hashPassword('123456');
+    const hashedPassword = await User.hashPassword(config.defaultUserPassword);
     const user = await User.findByIdAndUpdate(req.params.id, { password: hashedPassword }, { new: true });
     if (!user) return res.status(404).json({ message: '用户不存在' });
     res.json({ message: '密码重置成功', data: buildUserResponse(user) });

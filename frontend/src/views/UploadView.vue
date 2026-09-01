@@ -61,6 +61,7 @@
 import { onBeforeUnmount, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import { apiFetch } from '../api/http.js';
+import { clearAuth } from '../utils/auth.js';
 
 const router = useRouter();
 const file = ref(null);
@@ -80,7 +81,7 @@ function onPick(e) {
 }
 function goQa() { router.push('/qa'); }
 function goAdmin() { router.push('/admin'); }
-function logout() { localStorage.removeItem('enterpriseUser'); router.push('/'); }
+function logout() { clearAuth(); router.push('/'); }
 
 function resetFileInput() {
   if (fileInput.value) fileInput.value.value = '';

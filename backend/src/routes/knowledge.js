@@ -7,8 +7,8 @@ import mongoose from 'mongoose';
 import KnowledgeDocument from '../models/KnowledgeDocument.js';
 import { requireRole, getRequestUser } from '../utils/auth.js';
 import { generateAnswer } from '../services/ollamaService.js';
-import { extractTextFromFile, docxToPreviewHtml } from '../services/documentService.js';
-import { indexKnowledgeDocument } from '../services/knowledgeIndexService.js';
+import { docxToPreviewHtml } from '../services/documentService.js';
+import { enqueueIndexing } from '../services/knowledgeIndexQueue.js';
 import { deleteDocumentChunks } from '../services/chromaService.js';
 import KnowledgeChunk from '../models/KnowledgeChunk.js';
 import { fileURLToPath } from 'url';
@@ -105,14 +105,12 @@ async function removeChunks(fileHash) {
   await fs.rm(getChunkDirectory(fileHash), { recursive: true, force: true });
 }
 
-async function saveAndIndexUploadedFile({ savedPath, originalName, fileSize, title, categoryId, uploadedBy, uploadHash }) {
+/**
+ * 保存上传的文件记录并入队后台索引，接口立即返回。
+ * 文件正文解析、切块、向量化均在队列中异步完成。
+ */
+async function saveUploadedFile({ savedPath, originalName, fileSize, title, categoryId, uploadedBy, uploadHash }) {
   const ext = path.extname(originalName).replace('.', '').toLowerCase();
-  let contentText = '';
-  try {
-    contentText = String(await extractTextFromFile(savedPath, ext) || '').trim();
-  } catch (error) {
-    logError('文件内容解析失败', error);
-  }
 
   const doc = await KnowledgeDocument.create({
     title,
@@ -123,24 +121,31 @@ async function saveAndIndexUploadedFile({ savedPath, originalName, fileSize, tit
     localPath: path.relative(process.cwd(), savedPath),
     categoryId,
     chunkCount: 0,
-    content: contentText,
+    content: '',
     uploadedBy: uploadedBy || null,
     uploadHash,
-    status: 'processed',
+    status: 'pending',
+    errorMessage: '',
     vectorIds: []
   });
 
-  try {
-    await indexKnowledgeDocument(doc._id);
-  } catch (error) {
-    logError('上传文档索引失败', error);
-    const indexError = new Error('文件已保存，但向量索引失败，请检查 Ollama 和 Chroma 服务');
-    indexError.statusCode = 502;
-    indexError.documentId = String(doc._id);
-    throw indexError;
-  }
+  enqueueIndexing(doc._id);
+  logInfo('文档已保存并入队后台索引', `documentId=${doc._id}, title=${title}`);
 
   return KnowledgeDocument.findById(doc._id).populate('categoryId', '_id name').lean();
+}
+
+/** 已存在的文档：已完成的秒传，未完成/失败的重启索引。 */
+async function reuseOrRestartIndex(existing) {
+  if (existing.status === 'processed' && Number(existing.chunkCount || 0) > 0) {
+    return false;
+  }
+  await KnowledgeDocument.updateOne(
+    { _id: existing._id },
+    { $set: { status: 'pending', errorMessage: '' } }
+  );
+  enqueueIndexing(existing._id);
+  return true;
 }
 
 async function safeDeleteFile(filePath) {
@@ -378,11 +383,56 @@ router.get('/:id/status', async (req, res) => {
         fileType: doc.fileType,
         fileSize: doc.fileSize,
         chunkCount: doc.chunkCount,
+        errorMessage: doc.errorMessage || '',
         preview: (doc.content || '').replace(/\s+/g, ' ').trim().slice(0, 500)
       }
     });
   } catch (error) {
     res.status(500).json({ code: 500, message: '查询失败', error: error.message });
+  }
+});
+
+/**
+ * @openapi
+ * /api/knowledge/{id}/retry:
+ *   post:
+ *     tags: [Knowledge]
+ *     summary: 重新建立文档索引
+ *     description: 对 failed / pending / processing 状态的文档重置后重新入队索引。仅管理员可操作。
+ *     security:
+ *       - UserId: []
+ *         UserName: []
+ *         UserRole: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: 已重新入队
+ *       403:
+ *         description: 无权限
+ *       404:
+ *         description: 文档不存在
+ *       500:
+ *         description: 服务器错误
+ */
+router.post('/:id/retry', requireRole('admin'), async (req, res) => {
+  try {
+    const doc = await KnowledgeDocument.findById(req.params.id);
+    if (!doc) return res.status(404).json({ code: 404, message: '文档不存在' });
+
+    doc.status = 'pending';
+    doc.errorMessage = '';
+    doc.chunkCount = 0;
+    await doc.save();
+
+    enqueueIndexing(doc._id);
+    return res.json({ code: 200, message: '已重新加入索引队列', documentId: String(doc._id) });
+  } catch (error) {
+    logError('重新建立索引失败', error);
+    res.status(500).json({ code: 500, message: '重新建立索引失败', error: error.message });
   }
 });
 
@@ -612,27 +662,18 @@ router.post('/manual', requireRole('admin'), async (req, res) => {
       chunkCount: 0,
       content: safeContent,
       uploadedBy: currentUser.userId || null,
-      status: 'processed',
+      status: 'pending',
+      errorMessage: '',
       vectorIds: []
     });
 
-    try {
-      await indexKnowledgeDocument(doc._id);
-    } catch (indexError) {
-      logError('手动录入知识索引失败', indexError);
-      return res.status(502).json({
-        code: 502,
-        message: '知识已保存，但向量索引失败，请检查 Ollama 和 Chroma 服务',
-        documentId: String(doc._id),
-        error: indexError.message
-      });
-    }
+    enqueueIndexing(doc._id);
 
     const populatedDoc = await KnowledgeDocument.findById(doc._id).populate('categoryId', '_id name').lean();
 
     return res.status(201).json({
       code: 201,
-      message: '知识新增并建立索引成功',
+      message: '知识已保存，正在后台建立索引',
       documentId: String(doc._id),
       data: { ...populatedDoc, _id: String(populatedDoc._id) }
     });
@@ -693,7 +734,12 @@ router.post('/upload/check', async (req, res) => {
     }
     const existing = await KnowledgeDocument.findOne({ uploadHash: fileHash.toLowerCase() }).lean();
     if (existing) {
-      return res.json({ code: 200, message: '文件已存在，已秒传', data: { uploaded: true, documentId: String(existing._id), uploadedChunks: [] } });
+      const restarted = await reuseOrRestartIndex(existing);
+      return res.json({
+        code: 200,
+        message: restarted ? '文件已存在，正在重新建立索引' : '文件已存在，已秒传',
+        data: { uploaded: true, documentId: String(existing._id), uploadedChunks: [], restarted }
+      });
     }
     const uploadedChunks = (await getUploadedChunkIndexes(fileHash)).filter((index) => index < Number(totalChunks));
     return res.json({ code: 200, message: '可继续上传', data: { uploaded: false, uploadedChunks } });
@@ -749,8 +795,14 @@ router.post('/upload/merge', async (req, res) => {
 
     const existing = await KnowledgeDocument.findOne({ uploadHash: fileHash.toLowerCase() }).lean();
     if (existing) {
+      const restarted = await reuseOrRestartIndex(existing);
       await removeChunks(fileHash);
-      return res.json({ code: 200, message: '文件已存在，已秒传', documentId: String(existing._id), data: { ...existing, _id: String(existing._id) } });
+      return res.json({
+        code: 200,
+        message: restarted ? '文件已存在，正在重新建立索引' : '文件已存在，已秒传',
+        documentId: String(existing._id),
+        data: { ...existing, _id: String(existing._id), restarted }
+      });
     }
 
     const uploadedIndexes = await getUploadedChunkIndexes(fileHash);
@@ -780,7 +832,7 @@ router.post('/upload/merge', async (req, res) => {
     const title = String(rawTitle || '').trim() || path.basename(decodedOriginalName, path.extname(decodedOriginalName));
     let doc;
     try {
-      doc = await saveAndIndexUploadedFile({ savedPath, originalName: decodedOriginalName, fileSize: Number(fileSize), title, categoryId, uploadedBy: currentUser.userId, uploadHash: fileHash.toLowerCase() });
+      doc = await saveUploadedFile({ savedPath, originalName: decodedOriginalName, fileSize: Number(fileSize), title, categoryId, uploadedBy: currentUser.userId, uploadHash: fileHash.toLowerCase() });
     } catch (error) {
       // 并发的 merge 请求可能刚好创建了同一 MD5 文档，直接将其视为秒传成功。
       if (error?.code === 11000) {
@@ -796,7 +848,12 @@ router.post('/upload/merge', async (req, res) => {
       }
     }
     await removeChunks(fileHash);
-    return res.status(201).json({ code: 201, message: '文件上传成功，文档已入库并建立索引', documentId: String(doc._id), data: { ...doc, _id: String(doc._id) } });
+    return res.status(201).json({
+      code: 201,
+      message: '文件上传成功，正在后台建立索引',
+      documentId: String(doc._id),
+      data: { ...doc, _id: String(doc._id) }
+    });
   } catch (error) {
     if (savedPath && !error.documentId) await safeDeleteFile(savedPath);
     if (error.documentId) await removeChunks(req.body?.fileHash).catch(() => {});
@@ -842,15 +899,7 @@ router.post('/upload', upload.single('file'), async (req, res) => {
     savedPath = path.join(uploadsDir, storedFilename);
     await fs.writeFile(savedPath, file.buffer);
 
-    // 解析文件内容
-    let contentText = '';
-    try {
-      contentText = String(await extractTextFromFile(savedPath, ext) || '').trim();
-    } catch (extractError) {
-      logError('文件内容解析失败', extractError);
-      // 继续处理，内容为空也可以保存
-    }
-
+    // 正文解析与向量化统一在后台队列中完成，接口立即返回
     const doc = await KnowledgeDocument.create({
       title,
       filename: storedFilename,
@@ -860,31 +909,21 @@ router.post('/upload', upload.single('file'), async (req, res) => {
       localPath: path.relative(process.cwd(), savedPath),
       categoryId,
       chunkCount: 0,
-      content: contentText,
+      content: '',
       uploadedBy: currentUser.userId || null,
-      status: 'processed',
+      status: 'pending',
+      errorMessage: '',
       vectorIds: []
     });
 
-    logInfo(`文档已成功保存到MongoDB，文档ID：${doc._id}`);
-
-    try {
-      await indexKnowledgeDocument(doc._id);
-    } catch (indexError) {
-      logError('上传文档索引失败', indexError);
-      return res.status(502).json({
-        code: 502,
-        message: '文件已保存，但向量索引失败，请检查 Ollama 和 Chroma 服务',
-        documentId: String(doc._id),
-        error: indexError.message
-      });
-    }
+    enqueueIndexing(doc._id);
+    logInfo(`文档已保存到MongoDB并进入后台索引队列，文档ID：${doc._id}`);
 
     const populatedDoc = await KnowledgeDocument.findById(doc._id).populate('categoryId', '_id name').lean();
 
     return res.status(201).json({
       code: 201,
-      message: '文件上传成功，文档已入库并建立索引',
+      message: '文件上传成功，正在后台建立索引',
       documentId: String(doc._id),
       data: {
         ...populatedDoc,
