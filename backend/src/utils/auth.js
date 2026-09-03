@@ -21,7 +21,7 @@ export function signToken(user, options = {}) {
       tokenVersion: Number(user.tokenVersion || 0)
     },
     getJwtSecret(),
-    { expiresIn: options.expiresIn || config.jwtExpiresIn, secret: options.secret || getJwtSecret() }
+    { expiresIn: options.expiresIn || config.jwtExpiresIn }
   );
 }
 
@@ -62,7 +62,7 @@ export async function verifyToken(req, res, next) {
     }
 
     next();
-  } catch (error) {
+  } catch {
     return res.status(401).json({ message: '登录已过期或凭证无效，请重新登录' });
   }
 }

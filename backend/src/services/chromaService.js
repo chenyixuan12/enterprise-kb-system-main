@@ -50,7 +50,7 @@ export async function getOrCreateCollection() {
 
     const response = await client.get(collectionPath, { params: { limit: 100 } });
     const collection = response.data?.find((item) => item.name === name);
-    if (!collection) throw new Error(`Chroma collection 未找到：${name}`);
+    if (!collection) throw new Error(`Chroma collection 未找到：${name}`, { cause: error });
     return collection;
   }
 }

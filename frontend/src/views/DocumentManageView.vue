@@ -234,7 +234,7 @@ async function handleDelete(row) {
     await http.delete(`/knowledge/${row._id}`);
     await reload();
     ElMessage.success('删除成功');
-  } catch (error) {
+  } catch {
     ElMessage.error('删除失败');
   }
 }

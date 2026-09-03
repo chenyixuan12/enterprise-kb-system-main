@@ -11,6 +11,8 @@ dotenv.config({ path: path.resolve(__dirname, '..', '..', '.env') });
 export const config = {
   port: Number(process.env.SERVER_PORT || 3000),
   nodeEnv: process.env.NODE_ENV || 'development',
+  corsOrigins: String(process.env.CORS_ORIGINS || 'http://localhost:5173,http://localhost').split(',').map((value) => value.trim()).filter(Boolean),
+  apiDocsEnabled: String(process.env.API_DOCS_ENABLED || '').toLowerCase() === 'true' || process.env.NODE_ENV !== 'production',
   mongodbUri: process.env.MONGODB_URI || 'mongodb://localhost:27017/db_enterprise_qa',
   mongodbConnectTimeout: Number(process.env.MONGODB_CONNECT_TIMEOUT || 30000),
 
@@ -36,6 +38,15 @@ export const config = {
   embeddingBaseUrl: process.env.EMBEDDING_BASE_URL || '',
   embeddingApiKey: process.env.EMBEDDING_API_KEY || '',
   embeddingModelName: process.env.EMBEDDING_MODEL_NAME || 'text-embedding-v4',
+
+  // 重排（Rerank）服务配置（可选）：RRF 融合后再对候选片段做交叉编码器精排
+  rerankEnabled: String(process.env.RERANK_ENABLED || 'false').toLowerCase() === 'true',
+  rerankProvider: String(process.env.RERANK_PROVIDER || 'aliyun').toLowerCase(),
+  rerankBaseUrl: process.env.RERANK_BASE_URL || 'https://dashscope.aliyuncs.com',
+  rerankApiKey: process.env.RERANK_API_KEY || '',
+  rerankModelName: process.env.RERANK_MODEL_NAME || 'gte-rerank-v2',
+  rerankThreshold: Number(process.env.RERANK_THRESHOLD || 0.3),
+  rerankTimeout: Number(process.env.RERANK_TIMEOUT || 30000),
 
   defaultUserPassword: process.env.DEFAULT_USER_PASSWORD || '123456',
   uploadFileDir: process.env.UPLOAD_FILE_DIR || './uploads',

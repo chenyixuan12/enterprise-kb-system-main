@@ -231,7 +231,10 @@ export function apiFetchStream(url, options = {}, callbacks = {}) {
           } else if (eventType === 'mismatch' && callbacks.onMismatch) {
             callbacks.onMismatch(parsedData);
           } else if (eventType === 'chunk' && callbacks.onChunk) {
-            callbacks.onChunk(typeof parsedData === 'string' ? parsedData : String(parsedData || ''));
+            const chunkText = typeof parsedData === 'string'
+              ? parsedData
+              : (parsedData && typeof parsedData.chunk === 'string' ? parsedData.chunk : String(parsedData || ''));
+            callbacks.onChunk(chunkText);
           } else if (eventType === 'done' && callbacks.onDone) {
             callbacks.onDone(parsedData);
           } else if (eventType === 'error' && callbacks.onError) {

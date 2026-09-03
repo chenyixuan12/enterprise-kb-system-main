@@ -80,7 +80,7 @@ async function requestJson(url, { apiKey, payload, timeoutMs = 300000 }) {
     return response.json();
   } catch (error) {
     clearTimeout(timeoutId);
-    if (error.name === 'AbortError') throw new Error('大模型调用超时，请检查模型服务是否正常');
+    if (error.name === 'AbortError') throw new Error('大模型调用超时，请检查模型服务是否正常', { cause: error });
     throw error;
   }
 }
@@ -153,7 +153,7 @@ async function requestStream(url, { apiKey, provider, payload, timeoutMs = 30000
     return fullAnswer;
   } catch (error) {
     clearTimeout(timeoutId);
-    if (error.name === 'AbortError') throw new Error('大模型流式调用超时，请检查模型服务是否正常');
+    if (error.name === 'AbortError') throw new Error('大模型流式调用超时，请检查模型服务是否正常', { cause: error });
     throw error;
   }
 }
@@ -236,7 +236,7 @@ async function embedBatch(texts, { provider, baseUrl, apiKey, modelName, asQuery
   const inputs = texts.map((text) => (asQuery ? `${getQueryInstruction()}${String(text)}` : String(text)));
   const payloadInput = inputs.length === 1 ? inputs[0] : inputs;
 
-  let embeddings = null;
+  let embeddings;
   if (provider === 'ollama') {
     const url = `${normalizeBaseUrl(baseUrl)}/api/embed`;
     const result = await requestJson(url, {

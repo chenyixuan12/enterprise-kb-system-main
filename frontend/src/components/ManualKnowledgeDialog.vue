@@ -44,6 +44,16 @@
             <span v-else>按 <kbd>Tab</kbd> 让 AI 继续补全当前内容</span>
           </div>
 
+          <!-- 打字机式流式预览：AI 生成内容逐字实时渲染 -->
+          <div v-if="aiCompleting || streamPreview" class="stream-preview" ref="streamPreviewRef">
+            <div class="stream-preview-header">
+              <span class="stream-preview-dot"></span>
+              <span>AI 补全预览（实时生成中）</span>
+            </div>
+            <div class="stream-preview-body">{{ streamPreview }}</div>
+            <div class="stream-preview-hint">生成完成后将自动插入正文，无需手动复制</div>
+          </div>
+
           <div class="editor-footer">
             <span>内容字数：{{ plainTextLength }}</span>
             <span>HTML 形式会保存到数据库中</span>
@@ -59,8 +69,6 @@
         <el-select v-model="form.fileType" placeholder="请选择文件类型" style="width: 100%">
           <el-option label="Markdown (.md)" value="md" />
           <el-option label="文本 (.txt)" value="txt" />
-          <el-option label="PDF (.pdf)" value="pdf" />
-          <el-option label="Word (.docx)" value="docx" />
         </el-select>
       </el-form-item>
 
@@ -78,7 +86,7 @@
 
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
-import { http } from '../api/http.js';
+import { apiFetchStream, http } from '../api/http.js';
 import { ElMessage } from 'element-plus';
 
 const props = defineProps({
@@ -97,8 +105,10 @@ const formRef = ref();
 const loading = ref(false);
 const aiCompleting = ref(false);
 const editorRef = ref(null);
+const streamPreviewRef = ref(null);
 const editorPlaceholder = '请输入知识正文内容，支持富文本编辑...';
 const plainTextLength = ref(0);
+const streamPreview = ref('');
 const abortController = ref(null);
 
 const form = reactive({
@@ -139,13 +149,6 @@ function updatePlainTextLength() {
 function syncEditorToForm() {
   form.content = editorRef.value?.innerHTML || '';
   updatePlainTextLength();
-}
-
-function setEditorContent(html = '') {
-  if (editorRef.value) {
-    editorRef.value.innerHTML = html;
-    syncEditorToForm();
-  }
 }
 
 function getEditorSelectionRange() {
@@ -264,8 +267,81 @@ function isActiveFormat(command) {
 function normalizeCompletionText(text) {
   return String(text || '')
     .replace(/^\s+/, '')
-    .replace(/^[，,。．\.：:；;、\-—]+\s*/, '')
+    .replace(/^[，,。．.：:；;、—-]+\s*/, '')
     .trim();
+}
+
+function extractChapterIndex(text) {
+  const normalized = String(text || '');
+  const matches = [...normalized.matchAll(/第\s*([0-9一二三四五六七八九十百]+)\s*章\s*第\s*([0-9一二三四五六七八九十百]+)\s*点/g)];
+  if (!matches.length) return null;
+  const chineseToArabic = (value) => {
+    if (/^\d+$/.test(value)) return Number(value);
+    const digits = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+    let total = 0;
+    let section = 0;
+    for (const char of value) {
+      if (char === '十') { total = (total + section) * 10; section = 0; }
+      else if (char === '百') { total = (total + section) * 100; section = 0; }
+      else if (char === '零') { section = 0; }
+      else { section = section * 10 + (digits[char] || 0); }
+    }
+    return total + section || 0;
+  };
+  const last = matches[matches.length - 1];
+  const chapter = chineseToArabic(String(last?.[1] || '0'));
+  const point = chineseToArabic(String(last?.[2] || '0'));
+  return chapter > 0 && point > 0 ? { chapter, point } : null;
+}
+
+function buildCompletionRetryPrompt(baseContent, previousCompletion) {
+  const baseIndex = extractChapterIndex(String(baseContent || ''));
+  const prevIndex = extractChapterIndex(String(previousCompletion || ''));
+  const nextChapter = prevIndex?.chapter || baseIndex?.chapter || 1;
+  const nextPoint = prevIndex ? prevIndex.point + 1 : (baseIndex?.point || 0) + 1;
+  return `请继续补写上一段内容，要求如下：
+1. 只输出可直接插入的正文内容，不要解释。
+2. 内容不少于 500 字。
+3. 必须从“第 ${nextChapter} 章 第 ${nextPoint} 点”开始组织。
+4. 每一章至少包含 2 个小点，每个小点内容完整、具体、可直接入库。
+5. 避免与前文重复。`;
+}
+
+function isCompletionAcceptable(text) {
+  const plainText = String(text || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  return plainText.length >= 500 && /第\s*[0-9一二三四五六七八九十百]+\s*章\s*第\s*[0-9一二三四五六七八九十百]+\s*点/.test(plainText);
+}
+
+async function runCompletionRequest(payload, { isRetry = false } = {}) {
+  const completionParts = [];
+  let finalCompletion = '';
+
+  if (isRetry) streamPreview.value = '';
+
+  const { promise, abort } = apiFetchStream('/knowledge/ai-complete?stream=1', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  }, {
+    onChunk: (chunk) => {
+      const text = String(chunk || '');
+      if (!text) return;
+      completionParts.push(text);
+      finalCompletion += text;
+      streamPreview.value += text;
+      nextTick(() => {
+        const el = streamPreviewRef.value;
+        if (el) el.scrollTop = el.scrollHeight;
+      });
+    },
+    onError: (error) => {
+      throw error;
+    }
+  });
+
+  abortController.value = abort;
+  await promise;
+  return normalizeCompletionText(finalCompletion || completionParts.join(''));
 }
 
 async function handleTabCompletion() {
@@ -280,24 +356,39 @@ async function handleTabCompletion() {
 
   const cursorContext = getCursorContext();
   aiCompleting.value = true;
+  streamPreview.value = '';
   abortController.value = null;
 
   try {
-    const result = await http.post('/knowledge/ai-complete', {
+    let completion = await runCompletionRequest({
       title: form.title,
       content: form.content,
       categoryId: form.categoryId,
       cursorContext
     });
 
-    const completion = normalizeCompletionText(result?.data?.data?.completion || result?.data?.completion || '');
     if (!completion) {
-      console.warn('[AI Complete] empty response payload:', result?.data);
       ElMessage.info('AI 没有返回可补全内容');
       return;
     }
 
+    if (!isCompletionAcceptable(completion)) {
+      completion = await runCompletionRequest({
+        title: form.title,
+        content: form.content,
+        categoryId: form.categoryId,
+        cursorContext,
+        retryPrompt: buildCompletionRetryPrompt(form.content, completion)
+      }, { isRetry: true });
+    }
+
+    if (!isCompletionAcceptable(completion)) {
+      ElMessage.warning('AI 补全内容未达到要求，请继续补充后再插入');
+      return;
+    }
+
     insertHtmlAtCursor(completion.replace(/\n/g, '<br>'));
+    streamPreview.value = '';
     ElMessage.success('AI 补全完成');
   } catch (error) {
     ElMessage.error('AI 补全失败：' + (error.message || '未知错误'));
@@ -411,6 +502,69 @@ onBeforeUnmount(() => {
   border-bottom-width: 2px;
   border-radius: 4px;
   background: #fff;
+  font-size: 12px;
+}
+
+/* AI 补全打字机预览区 */
+.stream-preview {
+  border-top: 1px solid #ebeef5;
+  background: #f6f7fb;
+  padding: 10px 12px;
+}
+
+.stream-preview-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #6366f1;
+  margin-bottom: 6px;
+}
+
+.stream-preview-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #6366f1;
+  animation: stream-pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes stream-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
+.stream-preview-body {
+  max-height: 180px;
+  overflow-y: auto;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  font-size: 14px;
+  line-height: 1.75;
+  color: #303133;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* 打字机光标 */
+.stream-preview-body::after {
+  content: '▍';
+  display: inline-block;
+  margin-left: 2px;
+  color: #6366f1;
+  animation: stream-blink 0.8s steps(2, start) infinite;
+}
+
+@keyframes stream-blink {
+  to { visibility: hidden; }
+}
+
+.stream-preview-hint {
+  margin-top: 6px;
+  color: #a5a6b0;
   font-size: 12px;
 }
 

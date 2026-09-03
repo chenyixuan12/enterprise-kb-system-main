@@ -25,29 +25,17 @@
   </el-form>
 </template>
 
-<script setup lang="ts" name="TableSearch">
+<script setup name="TableSearch">
 import { ref, reactive, computed } from 'vue'
 import { ElMessage } from 'element-plus'
 
-interface FormItem {
-  label: string
-  prop: string
-  comp: string
-  placeholder?: string
-  options?: Array<{
-    value: string | number
-    label: string
-  }>
-  col?: Record<string, number>
-}
-
 const ruleFormRef = ref()
 
-const formData = reactive<Record<string, any>>({})
+const formData = reactive({})
 
 const props = defineProps({
   formItem: {
-    type: Array as () => FormItem[],
+    type: Array,
     default: () => []
   }
 })
@@ -65,7 +53,7 @@ const formItemAttars = computed(() => {
   return formItem
 })
 
-function isComp(comp: string) {
+function isComp(comp) {
   return {
     input: 'el-input',
     select: 'el-select'
@@ -76,7 +64,7 @@ const emit = defineEmits(['search'])
 
 function handleSearch() {
   // 清理空值参数，只传递有值的字段
-  const params: Record<string, any> = {}
+  const params = {}
   Object.keys(formData).forEach(key => {
     const value = formData[key]
     if (value !== undefined && value !== null && value !== '') {
@@ -87,7 +75,7 @@ function handleSearch() {
   emit('search', params)
 }
 
-function handleReset(formEl: any) {
+function handleReset(formEl) {
   if (!formEl) return
   formEl.resetFields()
   

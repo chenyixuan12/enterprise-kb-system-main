@@ -10,7 +10,7 @@ const router = Router();
  *   post:
  *     tags: [Auth]
  *     summary: 用户登录
- *     description: 校验用户名密码，返回用户基础信息、JWT access token 与 refresh token。前端后续通过 Authorization: Bearer <token> 携带身份。
+ *     description: 校验用户名密码，返回用户基础信息、JWT access token 与 refresh token。前端后续在 Authorization 请求头中携带 Bearer access token。
  *     requestBody:
  *       required: true
  *       content:

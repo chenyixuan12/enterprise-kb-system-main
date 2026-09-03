@@ -31,9 +31,7 @@ function summarizeTitle(question = '') {
  *     tags: [Chat]
  *     summary: 管理员查看所有会话
  *     security:
- *       - UserId: []
- *         UserName: []
- *         UserRole: []
+ *       - BearerAuth: []
  *     responses:
  *       200:
  *         description: 成功
@@ -59,9 +57,7 @@ router.get('/admin/all', requireRole('admin'), async (_req, res) => {
  *     tags: [Chat]
  *     summary: 获取当前用户会话列表
  *     security:
- *       - UserId: []
- *         UserName: []
- *         UserRole: []
+ *       - BearerAuth: []
  *     parameters:
  *       - in: query
  *         name: categoryId
@@ -165,9 +161,7 @@ router.delete('/:id', async (req, res) => {
  *     summary: 手动保存会话
  *     description: 兼容手动存储会话，QA 流式完成后也可调用
  *     security:
- *       - UserId: []
- *         UserName: []
- *         UserRole: []
+ *       - BearerAuth: []
  *     requestBody:
  *       content:
  *         application/json:

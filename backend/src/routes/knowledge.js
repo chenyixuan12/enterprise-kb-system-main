@@ -6,7 +6,7 @@ import multer from 'multer';
 import mongoose from 'mongoose';
 import KnowledgeDocument from '../models/KnowledgeDocument.js';
 import { requireRole, getRequestUser } from '../utils/auth.js';
-import { generateAnswer } from '../services/ollamaService.js';
+import { generateAnswer, generateAnswerStream } from '../services/ollamaService.js';
 import { docxToPreviewHtml } from '../services/documentService.js';
 import { enqueueIndexing } from '../services/knowledgeIndexQueue.js';
 import { deleteDocumentChunks } from '../services/chromaService.js';
@@ -160,38 +160,6 @@ function normalizeCategoryId(categoryId) {
   return null;
 }
 
-function normalizeText(text) {
-  return String(text || '')
-    .toLowerCase()
-    .replace(/[^\u4e00-\u9fa5a-z0-9]+/gi, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function buildMatchScore(text, keywords) {
-  const normalized = normalizeText(text);
-  let score = 0;
-  for (const kw of keywords) {
-    if (!kw) continue;
-    if (normalized.includes(kw)) score += 1;
-  }
-  return score;
-}
-
-function scoreDocument(doc, keywords, categoryId) {
-  let score = 0;
-  const title = normalizeText(doc.title);
-  const originalName = normalizeText(doc.originalName);
-  const content = normalizeText(doc.content || '');
-
-  if (categoryId && String(doc.categoryId || '') === String(categoryId)) score += 2;
-  score += buildMatchScore(title, keywords) * 8;
-  score += buildMatchScore(originalName, keywords) * 5;
-  score += buildMatchScore(content, keywords) * 2;
-
-  return score;
-}
-
 /**
  * @openapi
  * /api/knowledge/ai-complete:
@@ -200,9 +168,7 @@ function scoreDocument(doc, keywords, categoryId) {
  *     summary: AI 内容补全
  *     description: 根据已有正文和光标上下文，由 LLM 续写知识文档内容。仅管理员可用。
  *     security:
- *       - UserId: []
- *         UserName: []
- *         UserRole: []
+ *       - BearerAuth: []
  *     requestBody:
  *       required: true
  *       content:
@@ -226,8 +192,14 @@ function scoreDocument(doc, keywords, categoryId) {
  *         description: LLM 服务异常
  */
 router.post('/ai-complete', requireRole('admin'), async (req, res) => {
+  const wantsStream = String(req.headers.accept || '').includes('text/event-stream') || req.query?.stream === '1';
+
+  const sendSSE = (event, data) => {
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+
   try {
-    const { title = '', content = '', cursorContext = null, categoryId = '' } = req.body || {};
+    const { title = '', content = '', cursorContext = null, categoryId = '', retryPrompt = '' } = req.body || {};
     const parsedCursorContext = typeof cursorContext === 'string'
       ? (() => {
           try {
@@ -246,7 +218,7 @@ router.post('/ai-complete', requireRole('admin'), async (req, res) => {
       return res.status(400).json({ code: 400, message: '正文内容不能为空' });
     }
 
-    const prompt = `你是企业知识库写作助手，任务是“续写”而不是“改写”。请严格基于给定内容，在当前光标处继续补全文本。
+    let prompt = `你是企业知识库写作助手，任务是“续写”而不是“改写”。请严格基于给定内容，在当前光标处继续补全文本。
 
 标题：${title || '未填写'}
 所属分类：${categoryId || '未指定'}
@@ -263,27 +235,81 @@ ${content}
 
 输出要求：
 1. 只输出可直接插入到光标处的续写内容。
-2. 不要输出标题、序号前缀、解释、说明、分析或多余寒暄。
+2. 不要输出标题、解释、说明、分析或多余寒暄。
 3. 不要重复“当前光标前文本”的内容。
 4. 如果是句子中间，直接续写；如果更适合段落或列表，也可以继续写，但不要另起无关话题。
-5. 尽量避免以逗号、句号、冒号、连接词或空白开头。`;
+5. 尽量避免以逗号、句号、冒号、连接词或空白开头。
+6. 补全内容必须至少 500 字。
+7. 补全内容需按“第 X 章 第 Y 点”格式组织，若已有章节编号则延续，若无则从“第一章 第1点”开始。
+8. 每个章节点的内容需至少 150 字，确保整体结构清晰且信息完整。`;
+    if (String(retryPrompt || '').trim()) {
+      prompt = String(retryPrompt).trim();
+    }
 
-    const rawCompletion = String(await generateAnswer(prompt) || '');
-    const completion = rawCompletion
+    if (!wantsStream) {
+      const rawCompletion = String(await generateAnswer(prompt) || '');
+      const completion = rawCompletion
+        .replace(/^\s+/, '')
+        .replace(/^[，,。．.：:；;、—-]+\s*/, '')
+        .trim();
+
+      console.log('[AI Complete] raw length:', rawCompletion.length, 'clean length:', completion.length, 'preview:', rawCompletion.slice(0, 120));
+
+      return res.json({
+        code: 200,
+        message: '补全成功',
+        data: { completion, rawCompletion }
+      });
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    if (typeof res.flushHeaders === 'function') res.flushHeaders();
+
+    sendSSE('start', { message: '开始补全' });
+
+    let rawCompletion = '';
+    let lastChunk = '';
+    const completion = await generateAnswerStream(prompt, (chunk) => {
+      const cleanChunk = String(chunk || '');
+      if (!cleanChunk) return;
+      rawCompletion += cleanChunk;
+      lastChunk = cleanChunk;
+      sendSSE('chunk', { chunk: cleanChunk });
+    });
+
+    const normalizedCompletion = String(completion || rawCompletion || '')
       .replace(/^\s+/, '')
-      .replace(/^[，,。．\.：:；;、\-—]+\s*/, '')
+      .replace(/^[，,。．.：:；;、—-]+\s*/, '')
       .trim();
 
-    console.log('[AI Complete] raw length:', rawCompletion.length, 'clean length:', completion.length, 'preview:', rawCompletion.slice(0, 120));
+    console.log('[AI Complete] raw length:', rawCompletion.length, 'clean length:', normalizedCompletion.length, 'preview:', rawCompletion.slice(0, 120));
 
-    return res.json({
-      code: 200,
-      message: '补全成功',
-      data: { completion, rawCompletion }
+    sendSSE('done', {
+      completion: normalizedCompletion,
+      rawCompletion,
+      lastChunk
     });
+    return res.end();
   } catch (error) {
     logError('AI补全失败', error);
     const statusCode = /api key|authorization|model|connect|fetch|timeout/i.test(error?.message || '') ? 502 : 500;
+    if (String(req.headers.accept || '').includes('text/event-stream') || req.query?.stream === '1') {
+      try {
+        res.status(statusCode);
+        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache, no-transform');
+        res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Accel-Buffering', 'no');
+        if (typeof res.flushHeaders === 'function') res.flushHeaders();
+        res.write(`event: error\ndata: ${JSON.stringify({ message: error.message })}\n\n`);
+        return res.end();
+      } catch {
+        // fall through to json response
+      }
+    }
     return res.status(statusCode).json({ code: statusCode, message: 'AI补全失败', error: error.message });
   }
 });
@@ -400,9 +426,7 @@ router.get('/:id/status', async (req, res) => {
  *     summary: 重新建立文档索引
  *     description: 对 failed / pending / processing 状态的文档重置后重新入队索引。仅管理员可操作。
  *     security:
- *       - UserId: []
- *         UserName: []
- *         UserRole: []
+ *       - BearerAuth: []
  *     parameters:
  *       - in: path
  *         name: id
@@ -565,9 +589,7 @@ router.get('/:id/preview', async (req, res) => {
  *     summary: 删除知识文档
  *     description: 仅管理员可操作，同时删除本地文件
  *     security:
- *       - UserId: []
- *         UserName: []
- *         UserRole: []
+ *       - BearerAuth: []
  *     parameters:
  *       - in: path
  *         name: id
@@ -604,9 +626,7 @@ router.delete('/:id', requireRole('admin'), async (req, res) => {
  *     summary: 手动录入知识文档
  *     description: 仅管理员可操作，直接以文本形式创建文档
  *     security:
- *       - UserId: []
- *         UserName: []
- *         UserRole: []
+ *       - BearerAuth: []
  *     requestBody:
  *       required: true
  *       content:
@@ -694,9 +714,7 @@ router.post('/manual', requireRole('admin'), async (req, res) => {
  *       使用 multipart/form-data，字段 file 为文件，title 和 categoryId 为表单字段。
  *       无需 admin 权限，但会记录 x-user-id 作为上传者。
  *     security:
- *       - UserId: []
- *         UserName: []
- *         UserRole: []
+ *       - BearerAuth: []
  *     requestBody:
  *       required: true
  *       content:

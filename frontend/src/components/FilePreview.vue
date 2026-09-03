@@ -22,15 +22,15 @@
       </el-button>
     </div>
 
-    <!-- PDF / 图片：直接内嵌原始文件 -->
+    <!-- PDF / 图片：通过携带 JWT 的请求获取受保护文件 -->
     <template v-if="mode === 'native'">
       <div v-if="fileType === 'pdf'" ref="scrollEl" class="preview-scroll">
-        <iframe :src="fileUrl" class="preview-iframe" :style="zoomStyle" title="PDF 预览"></iframe>
+        <iframe :src="protectedFileUrl" class="preview-iframe" :style="zoomStyle" title="PDF 预览"></iframe>
       </div>
       <div v-else ref="scrollEl" class="preview-scroll preview-image-scroll">
         <div class="preview-image-pad">
           <img
-            :src="fileUrl"
+            :src="protectedFileUrl"
             :alt="doc?.originalName || '图片预览'"
             class="preview-image"
             :style="imageStyle"
@@ -44,7 +44,7 @@
     <template v-else-if="mode === 'word'">
       <div v-if="loading" class="preview-tip">正在解析 Word 文档…</div>
       <div v-else-if="wordHtml" ref="scrollEl" class="preview-scroll">
-        <iframe :srcdoc="wordHtml" class="preview-iframe" :style="zoomStyle" title="Word 预览"></iframe>
+        <iframe :srcdoc="wordHtml" sandbox class="preview-iframe" :style="zoomStyle" title="Word 预览"></iframe>
       </div>
       <el-empty v-else description="当前文档暂无可预览内容" />
     </template>
@@ -53,6 +53,8 @@
     <template v-else-if="mode === 'text'">
       <div v-if="loading" class="preview-tip">正在加载文件内容…</div>
       <div v-else-if="textContent" ref="scrollEl" class="preview-scroll preview-text-scroll">
+        <!-- renderedHtml 由本组件的受限 Markdown 渲染器生成，不接受原始 HTML。 -->
+        <!-- eslint-disable-next-line vue/no-v-html -->
         <div class="preview-doc" :class="{ 'is-markdown': fileType === 'md' }" :style="textZoomStyle" v-html="renderedHtml"></div>
       </div>
       <el-empty v-else description="当前文档暂无可预览内容" />
@@ -77,6 +79,7 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { Download, ZoomIn, ZoomOut, FullScreen, Close, Aim } from '@element-plus/icons-vue';
+import { getAuthHeaders } from '../utils/auth.js';
 
 const props = defineProps({
   doc: { type: Object, default: null }
@@ -84,6 +87,7 @@ const props = defineProps({
 
 const textContent = ref('');
 const wordHtml = ref('');
+const protectedFileUrl = ref('');
 const loading = ref(false);
 const scale = ref(1);
 const isFullscreen = ref(false);
@@ -247,14 +251,30 @@ function onKeydown(event) {
   }
 }
 
-function getAuthHeaders() {
-  const user = JSON.parse(localStorage.getItem('enterpriseUser') || 'null');
-  if (!user) return {};
-  return {
-    'x-user-id': user._id || '',
-    'x-user-name': user.username || '',
-    'x-user-role': user.role || 'user'
-  };
+function revokeProtectedFileUrl() {
+  if (protectedFileUrl.value) URL.revokeObjectURL(protectedFileUrl.value);
+  protectedFileUrl.value = '';
+}
+
+async function fetchProtectedFile() {
+  if (!fileUrl.value) return;
+
+  loading.value = true;
+  fetchController = new AbortController();
+  try {
+    const response = await fetch(fileUrl.value, {
+      signal: fetchController.signal,
+      headers: getAuthHeaders()
+    });
+    if (!response.ok) throw new Error('获取原始文件失败');
+    const blob = await response.blob();
+    revokeProtectedFileUrl();
+    protectedFileUrl.value = URL.createObjectURL(blob);
+  } catch (error) {
+    if (error.name !== 'AbortError') revokeProtectedFileUrl();
+  } finally {
+    loading.value = false;
+  }
 }
 
 async function fetchFileText() {
@@ -314,8 +334,20 @@ async function fetchWordHtml() {
   }
 }
 
-function downloadFile() {
-  if (fileUrl.value) window.open(fileUrl.value, '_blank');
+async function downloadFile() {
+  if (!fileUrl.value) return;
+  try {
+    const response = await fetch(fileUrl.value, { headers: getAuthHeaders() });
+    if (!response.ok) throw new Error('下载文件失败');
+    const objectUrl = URL.createObjectURL(await response.blob());
+    const link = document.createElement('a');
+    link.href = objectUrl;
+    link.download = props.doc?.originalName || 'download';
+    link.click();
+    URL.revokeObjectURL(objectUrl);
+  } catch {
+    // 失败时保留当前预览状态，避免覆盖用户正在查看的内容。
+  }
 }
 
 function escapeHtml(value = '') {
@@ -327,10 +359,15 @@ function escapeHtml(value = '') {
     .replace(/'/g, '&#39;');
 }
 
-function resolveImageSrc(src = '') {
-  const trimmed = src.trim();
-  if (/^(https?:|data:|\/)/.test(trimmed)) return trimmed;
-  return `${window.location.origin}${trimmed.startsWith('/') ? '' : '/'}${trimmed}`;
+function resolveSafeUrl(source = '') {
+  const value = String(source).trim();
+  if (!value) return '';
+  try {
+    const url = new URL(value, window.location.origin);
+    return ['http:', 'https:'].includes(url.protocol) ? url.href : '';
+  } catch {
+    return '';
+  }
 }
 
 function inlineMarkdown(text = '') {
@@ -338,8 +375,14 @@ function inlineMarkdown(text = '') {
     .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
     .replace(/\*(.+?)\*/g, '<em>$1</em>')
     .replace(/`([^`]+)`/g, '<code>$1</code>')
-    .replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (_match, alt, src) => `<img src="${resolveImageSrc(src)}" alt="${alt}" />`)
-    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    .replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (_match, alt, src) => {
+      const url = resolveSafeUrl(src);
+      return url ? `<img src="${escapeHtml(url)}" alt="${alt}" />` : '';
+    })
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_match, label, href) => {
+      const url = resolveSafeUrl(href);
+      return url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener">${label}</a>` : label;
+    });
 }
 
 function renderMarkdown(text = '') {
@@ -431,11 +474,13 @@ watch(
   () => {
     textContent.value = '';
     wordHtml.value = '';
+    revokeProtectedFileUrl();
     imageNatural.value = { width: 0, height: 0 };
     imageLoaded.value = false;
     imageTouched = false;
     scale.value = 1;
-    if (mode.value === 'text') fetchFileText();
+    if (mode.value === 'native') fetchProtectedFile();
+    else if (mode.value === 'text') fetchFileText();
     else if (mode.value === 'word') fetchWordHtml();
   },
   { immediate: true }
@@ -456,6 +501,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   fetchController?.abort();
+  revokeProtectedFileUrl();
   document.removeEventListener('fullscreenchange', onFullscreenChange);
   window.removeEventListener('keydown', onKeydown);
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {});

@@ -1,26 +1,35 @@
 import express from 'express';
 import cors from 'cors';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import helmet from 'helmet';
+import { rateLimit } from 'express-rate-limit';
 import swaggerUi from 'swagger-ui-express';
 import apiRouter from './routes/index.js';
 import categoryRoutes from './routes/category.js';
 import { swaggerSpec } from './config/swagger.js';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+import { config } from './config/env.js';
 
 const app = express();
 
-// 中间件：支持跨域、JSON 以及表单提交
-// 关键：必须放在最前面，并且让 cors 中间件统一处理所有 OPTIONS 预检请求
+const apiRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 300,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: { message: '请求过于频繁，请稍后再试' }
+});
+
 const corsOptions = {
-  origin: true,
+  origin(origin, callback) {
+    if (!origin || config.corsOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error('不允许的跨域来源'));
+  },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 };
 
+app.disable('x-powered-by');
+app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: false }));
 app.use(cors(corsOptions));
 app.use((req, res, next) => {
   if (req.method === 'OPTIONS') {
@@ -31,13 +40,14 @@ app.use((req, res, next) => {
 
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
-app.use('/uploads', express.static(path.resolve(__dirname, '../uploads')));
-// OpenAPI JSON：供 Apifox / Postman 等工具导入（文档仍以代码中的 @openapi 注解为准）
-app.get('/api-docs.json', (_req, res) => {
-  res.json(swaggerSpec);
-});
-app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, { explorer: true }));
-app.use('/api', apiRouter);
+if (config.apiDocsEnabled) {
+  app.get('/api-docs.json', (_req, res) => {
+    res.json(swaggerSpec);
+  });
+  app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, { explorer: true }));
+}
+app.use('/api/category', apiRateLimiter, categoryRoutes);
+app.use('/api', apiRateLimiter, apiRouter);
 
 /**
  * @openapi
@@ -61,7 +71,4 @@ app.use('/api', apiRouter);
 app.get('/health', (_req, res) => {
   res.json({ message: 'ok' });
 });
-//挂载知识库分类路由
-app.use('/api/category', categoryRoutes);
-
 export default app;

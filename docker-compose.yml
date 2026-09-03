@@ -3,8 +3,8 @@ services:
     image: mongo:7
     container_name: enterprise-mongo
     environment:
-      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME:-kbadmin}
-      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD:-kbadmin123}
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME:?MONGO_INITDB_ROOT_USERNAME must be set in .env}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD:?MONGO_INITDB_ROOT_PASSWORD must be set in .env}
     # 数据库仅在内网使用，不映射公网端口；如需本机调试可改为 "127.0.0.1:27017:27017"
     volumes:
       - mongo-data:/data/db
@@ -14,9 +14,9 @@ services:
         - mongosh
         - --quiet
         - --username
-        - ${MONGO_INITDB_ROOT_USERNAME:-kbadmin}
+        - ${MONGO_INITDB_ROOT_USERNAME:?MONGO_INITDB_ROOT_USERNAME must be set in .env}
         - --password
-        - ${MONGO_INITDB_ROOT_PASSWORD:-kbadmin123}
+        - ${MONGO_INITDB_ROOT_PASSWORD:?MONGO_INITDB_ROOT_PASSWORD must be set in .env}
         - --authenticationDatabase
         - admin
         - --eval
@@ -74,7 +74,7 @@ services:
       - .env
     environment:
       NODE_ENV: production
-      MONGODB_URI: mongodb://${MONGO_INITDB_ROOT_USERNAME:-kbadmin}:${MONGO_INITDB_ROOT_PASSWORD:-kbadmin123}@mongo:27017/db_enterprise_qa?authSource=admin
+      MONGODB_URI: mongodb://${MONGO_INITDB_ROOT_USERNAME:?MONGO_INITDB_ROOT_USERNAME must be set in .env}:${MONGO_INITDB_ROOT_PASSWORD:?MONGO_INITDB_ROOT_PASSWORD must be set in .env}@mongo:27017/db_enterprise_qa?authSource=admin
       CHROMA_BASE_URL: http://chroma:8000
       EMBEDDING_BASE_URL: http://ollama:11434
       UPLOAD_FILE_DIR: /app/uploads
@@ -113,6 +113,12 @@ services:
     depends_on:
       backend:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     restart: unless-stopped
 
 volumes:

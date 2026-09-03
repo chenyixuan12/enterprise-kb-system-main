@@ -3,7 +3,7 @@
   "info": {
     "title": "企业知识库问答系统 API",
     "version": "1.0.0",
-    "description": "企业内部知识库问答后端接口文档。\n\n\n## 鉴权约定（教学演示版）\n\n本项目**不使用 JWT/Session**，登录后由前端在每次请求中携带以下自定义请求头：\n\n| 请求头 | 说明 | 示例 |\n|--------|------|------|\n| `x-user-id` | 用户 MongoDB `_id` | `674a1b2c3d4e5f6789012345` |\n| `x-user-name` | 用户名 | `admin` |\n| `x-user-role` | 角色，`admin` 或 `user` | `admin` |\n\n**流程：**\n1. 调用 `POST /api/auth/login` 获取用户信息\n2. 前端将用户信息存入 `localStorage.enterpriseUser`\n3. Axios/Fetch 拦截器自动注入上述三个请求头\n\n**注意：** 请求头可被客户端伪造，仅适用于教学演示；生产环境应改用 JWT 等标准鉴权方案。\n\n**权限说明：**\n- 标注 `admin` 的接口需 `x-user-role: admin`\n- 未标注的接口通常无需登录，但部分操作会读取 `x-user-id` 记录操作者\n\n\n\n## SSE 流式问答协议\n\n`POST /api/qa/ask` 返回 `text/event-stream`，而非普通 JSON。\n\n**请求：**\n```json\n{\n  \"question\": \"如何申请年假？\",\n  \"categoryId\": \"674a1b2c3d4e5f6789012345\",\n  \"sessionId\": \"可选，续接已有会话\"\n}\n```\n\n**响应事件类型：**\n\n| 事件 | 数据格式 | 说明 |\n|------|----------|------|\n| `sources` | `Source[]` | 召回的参考文档列表 |\n| `mismatch` | `{ message, suggestedKnowledge, suggestedKnowledgeId, recommendedKnowledge }` | 当前知识库与问题不匹配时提示切换 |\n| `chunk` | `string` | LLM 生成的文本片段（流式） |\n| `done` | `{ answer, sessionId, sources, recommendedKnowledge, ... }` | 生成完成 |\n| `error` | `{ message }` | 发生错误 |\n\n**SSE 原始格式示例：**\n```\nevent: sources\ndata: [{\"documentId\":\"...\",\"title\":\"员工手册\",\"snippet\":\"...\"}]\n\nevent: chunk\ndata: \"根据\"\n\nevent: done\ndata: {\"answer\":\"完整答案\",\"sessionId\":\"...\",\"sources\":[...]}\n```\n\n**curl 调试示例：**\n```bash\ncurl -N -X POST http://localhost:3000/api/qa/ask \\\n  -H \"Content-Type: application/json\" \\\n  -H \"x-user-id: YOUR_USER_ID\" \\\n  -H \"x-user-name: admin\" \\\n  -H \"x-user-role: admin\" \\\n  -d '{\"question\":\"如何请假？\",\"categoryId\":\"CATEGORY_ID\"}'\n```\n\n\n\n## 响应格式说明\n\n各模块响应 envelope 不完全统一，对接时请注意：\n\n| 模块 | 成功格式 | 错误格式 |\n|------|----------|----------|\n| auth / users / chat | `{ message, data }` | `{ message, error? }` |\n| knowledge / qa / admin | `{ code, message, data }` | `{ code, message, error? }` |\n| category | `{ code, msg, data }` | `{ code, msg }` |\n"
+    "description": "企业内部知识库问答后端接口文档。\n\n\n## 鉴权约定\n\n调用 `POST /api/auth/login` 后，从响应中取得 `accessToken` 和 `refreshToken`。除登录、刷新令牌和健康检查以外的接口都需要携带：\n\n`Authorization: Bearer <accessToken>`\n\n访问令牌默认有效期为 30 分钟，失效后调用 `POST /api/auth/refresh` 使用 refresh token 换取新令牌。管理员接口还要求令牌中的角色为 `admin`。\n\n\n\n## SSE 流式问答协议\n\n`POST /api/qa/ask` 返回 `text/event-stream`，而非普通 JSON。\n\n**请求：**\n```json\n{\n  \"question\": \"如何申请年假？\",\n  \"categoryId\": \"674a1b2c3d4e5f6789012345\",\n  \"sessionId\": \"可选，续接已有会话\"\n}\n```\n\n**响应事件类型：**\n\n| 事件 | 数据格式 | 说明 |\n|------|----------|------|\n| `sources` | `Source[]` | 召回的参考文档列表 |\n| `mismatch` | `{ message, suggestedKnowledge, suggestedKnowledgeId, recommendedKnowledge }` | 当前知识库与问题不匹配时提示切换 |\n| `chunk` | `string` | LLM 生成的文本片段（流式） |\n| `done` | `{ answer, sessionId, sources, recommendedKnowledge, ... }` | 生成完成 |\n| `error` | `{ message }` | 发生错误 |\n\n**SSE 原始格式示例：**\n```\nevent: sources\ndata: [{\"documentId\":\"...\",\"title\":\"员工手册\",\"snippet\":\"...\"}]\n\nevent: chunk\ndata: \"根据\"\n\nevent: done\ndata: {\"answer\":\"完整答案\",\"sessionId\":\"...\",\"sources\":[...]}\n```\n\n**curl 调试示例：**\n```bash\ncurl -N -X POST http://localhost:3000/api/qa/ask \\\n  -H \"Content-Type: application/json\" \\\n  -H \"Authorization: Bearer ACCESS_TOKEN\" \\\n  -d '{\"question\":\"如何请假？\",\"categoryId\":\"CATEGORY_ID\"}'\n```\n\n\n\n## 响应格式说明\n\n各模块响应 envelope 不完全统一，对接时请注意：\n\n| 模块 | 成功格式 | 错误格式 |\n|------|----------|----------|\n| auth / users / chat | `{ message, data }` | `{ message, error? }` |\n| knowledge / qa / admin | `{ code, message, data }` | `{ code, message, error? }` |\n| category | `{ code, msg, data }` | `{ code, msg }` |\n"
   },
   "servers": [
     {
@@ -47,23 +47,11 @@
   ],
   "components": {
     "securitySchemes": {
-      "UserId": {
-        "type": "apiKey",
-        "in": "header",
-        "name": "x-user-id",
-        "description": "登录用户的 MongoDB _id"
-      },
-      "UserName": {
-        "type": "apiKey",
-        "in": "header",
-        "name": "x-user-name",
-        "description": "登录用户名"
-      },
-      "UserRole": {
-        "type": "apiKey",
-        "in": "header",
-        "name": "x-user-role",
-        "description": "用户角色：admin 或 user"
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "登录接口返回的 access token"
       }
     },
     "schemas": {
@@ -133,7 +121,7 @@
           },
           "password": {
             "type": "string",
-            "example": "123456"
+            "example": "your_password"
           }
         }
       },
@@ -270,9 +258,7 @@
         "description": "仅管理员可访问，支持 keyword、role、status 筛选",
         "security": [
           {
-            "UserId": [],
-            "UserName": [],
-            "UserRole": []
+            "BearerAuth": []
           }
         ],
         "parameters": [
@@ -342,9 +328,7 @@
         "description": "仅管理员可操作，默认密码为 123456",
         "security": [
           {
-            "UserId": [],
-            "UserName": [],
-            "UserRole": []
+            "BearerAuth": []
           }
         ],
         "requestBody": {
@@ -412,9 +396,7 @@
         "summary": "获取用户详情",
         "security": [
           {
-            "UserId": [],
-            "UserName": [],
-            "UserRole": []
+            "BearerAuth": []
           }
         ],
         "parameters": [
@@ -449,9 +431,7 @@
         "summary": "更新用户",
         "security": [
           {
-            "UserId": [],
-            "UserName": [],
-            "UserRole": []
+            "BearerAuth": []
           }
         ],
         "parameters": [
@@ -523,9 +503,7 @@
         "summary": "删除用户",
         "security": [
           {
-            "UserId": [],
-            "UserName": [],
-            "UserRole": []
+            "BearerAuth": []
           }
         ],
         "parameters": [
@@ -563,9 +541,7 @@
         "description": "仅管理员可操作，重置为默认密码 123456",
         "security": [
           {
-            "UserId": [],
-            "UserName": [],
-            "UserRole": []
+            "BearerAuth": []
           }
         ],
         "parameters": [
@@ -602,9 +578,7 @@
         "summary": "切换用户状态",
         "security": [
           {
-            "UserId": [],
-            "UserName": [],
-            "UserRole": []
+            "BearerAuth": []
           }
         ],
         "parameters": [
@@ -664,9 +638,7 @@
         "description": "核心问答接口，返回 Server-Sent Events 流式响应（`text/event-stream`）。\n\n**事件类型：**\n- `sources` — 召回的参考文档列表\n- `mismatch` — 当前知识库与问题不匹配，建议切换\n- `chunk` — LLM 生成的文本片段\n- `done` — 生成完成，包含完整答案和 sessionId\n- `error` — 发生错误\n\n详细协议说明见文档首页「SSE 流式问答协议」章节。\n",
         "security": [
           {
-            "UserId": [],
-            "UserName": [],
-            "UserRole": []
+            "BearerAuth": []
           }
         ],
         "requestBody": {
@@ -716,9 +688,7 @@
         "description": "根据已有正文和光标上下文，由 LLM 续写知识文档内容。仅管理员可用。",
         "security": [
           {
-            "UserId": [],
-            "UserName": [],
-            "UserRole": []
+            "BearerAuth": []
           }
         ],
         "requestBody": {
@@ -839,9 +809,7 @@
         "description": "仅管理员可操作，同时删除本地文件",
         "security": [
           {
-            "UserId": [],
-            "UserName": [],
-            "UserRole": []
+            "BearerAuth": []
           }
         ],
         "parameters": [
@@ -899,6 +867,103 @@
         }
       }
     },
+    "/api/knowledge/{id}/retry": {
+      "post": {
+        "tags": [
+          "Knowledge"
+        ],
+        "summary": "重新建立文档索引",
+        "description": "对 failed / pending / processing 状态的文档重置后重新入队索引。仅管理员可操作。",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "已重新入队"
+          },
+          "403": {
+            "description": "无权限"
+          },
+          "404": {
+            "description": "文档不存在"
+          },
+          "500": {
+            "description": "服务器错误"
+          }
+        }
+      }
+    },
+    "/api/knowledge/{id}/file": {
+      "get": {
+        "tags": [
+          "Knowledge"
+        ],
+        "summary": "获取文档原始文件",
+        "description": "返回上传时保存的原始文件（pdf / docx / md / txt / 图片），用于前端按文件类型预览",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "文件内容"
+          },
+          "404": {
+            "description": "文件不存在"
+          },
+          "500": {
+            "description": "服务器错误"
+          }
+        }
+      }
+    },
+    "/api/knowledge/{id}/preview": {
+      "get": {
+        "tags": [
+          "Knowledge"
+        ],
+        "summary": "获取文档可视化预览（docx 转 HTML，保留内嵌图片）",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "HTML 预览内容"
+          },
+          "404": {
+            "description": "文件不存在"
+          },
+          "500": {
+            "description": "服务器错误"
+          }
+        }
+      }
+    },
     "/api/knowledge/manual": {
       "post": {
         "tags": [
@@ -908,9 +973,7 @@
         "description": "仅管理员可操作，直接以文本形式创建文档",
         "security": [
           {
-            "UserId": [],
-            "UserName": [],
-            "UserRole": []
+            "BearerAuth": []
           }
         ],
         "requestBody": {
@@ -973,9 +1036,7 @@
         "description": "支持 txt、pdf、docx、md 格式，单文件最大 10MB。\n使用 multipart/form-data，字段 file 为文件，title 和 categoryId 为表单字段。\n无需 admin 权限，但会记录 x-user-id 作为上传者。\n",
         "security": [
           {
-            "UserId": [],
-            "UserName": [],
-            "UserRole": []
+            "BearerAuth": []
           }
         ],
         "requestBody": {
@@ -1027,9 +1088,7 @@
         "summary": "管理员查看所有会话",
         "security": [
           {
-            "UserId": [],
-            "UserName": [],
-            "UserRole": []
+            "BearerAuth": []
           }
         ],
         "responses": {
@@ -1053,9 +1112,7 @@
         "summary": "获取当前用户会话列表",
         "security": [
           {
-            "UserId": [],
-            "UserName": [],
-            "UserRole": []
+            "BearerAuth": []
           }
         ],
         "parameters": [
@@ -1143,9 +1200,7 @@
         "description": "兼容手动存储会话，QA 流式完成后也可调用",
         "security": [
           {
-            "UserId": [],
-            "UserName": [],
-            "UserRole": []
+            "BearerAuth": []
           }
         ],
         "requestBody": {
@@ -1199,7 +1254,7 @@
           "Auth"
         ],
         "summary": "用户登录",
-        "description": "校验用户名密码，返回用户基础信息。前端登录后将信息存入 localStorage，后续请求通过 x-user-* 请求头携带身份。",
+        "description": "校验用户名密码，返回用户基础信息、JWT access token 与 refresh token。前端后续在 Authorization 请求头中携带 Bearer access token。",
         "requestBody": {
           "required": true,
           "content": {
@@ -1212,24 +1267,10 @@
         },
         "responses": {
           "200": {
-            "description": "登录成功",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/LoginResponse"
-                }
-              }
-            }
+            "description": "登录成功"
           },
           "401": {
-            "description": "用户名或密码错误",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
+            "description": "用户名或密码错误"
           },
           "500": {
             "description": "服务器错误"
@@ -1237,29 +1278,33 @@
         }
       }
     },
-    "/api/auth/password-tip": {
-      "get": {
+    "/api/auth/refresh": {
+      "post": {
         "tags": [
           "Auth"
         ],
-        "summary": "获取默认测试密码提示",
-        "description": "教学演示用，返回统一默认密码说明",
+        "summary": "刷新访问令牌",
+        "description": "使用 refresh token 换取新的 access token（并同步刷新 refresh token）。",
         "responses": {
           "200": {
-            "description": "成功",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "message": {
-                      "type": "string",
-                      "example": "默认测试密码统一为 123456"
-                    }
-                  }
-                }
-              }
-            }
+            "description": "刷新成功"
+          },
+          "401": {
+            "description": "刷新令牌无效或已过期"
+          }
+        }
+      }
+    },
+    "/api/auth/logout": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "退出登录",
+        "description": "通过提升 tokenVersion 让当前用户所有已签发 token 失效。",
+        "responses": {
+          "200": {
+            "description": "退出成功"
           }
         }
       }

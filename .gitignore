@@ -141,3 +141,8 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Runtime knowledge data must be persisted and backed up outside Git.
+backend/uploads/
+chroma/
+chroma-data/

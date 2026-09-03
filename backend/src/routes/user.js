@@ -31,9 +31,7 @@ function buildUserResponse(user) {
  *     summary: 获取用户列表
  *     description: 仅管理员可访问，支持 keyword、role、status 筛选
  *     security:
- *       - UserId: []
- *         UserName: []
- *         UserRole: []
+ *       - BearerAuth: []
  *     parameters:
  *       - in: query
  *         name: keyword
@@ -89,9 +87,7 @@ router.get('/', requireRole('admin'), async (req, res) => {
  *     tags: [Users]
  *     summary: 获取用户详情
  *     security:
- *       - UserId: []
- *         UserName: []
- *         UserRole: []
+ *       - BearerAuth: []
  *     parameters:
  *       - in: path
  *         name: id
@@ -126,9 +122,7 @@ router.get('/:id', requireRole('admin'), async (req, res) => {
  *     summary: 新增用户
  *     description: 仅管理员可操作，默认密码为 123456
  *     security:
- *       - UserId: []
- *         UserName: []
- *         UserRole: []
+ *       - BearerAuth: []
  *     requestBody:
  *       required: true
  *       content:
@@ -187,9 +181,7 @@ router.post('/', requireRole('admin'), async (req, res) => {
  *     tags: [Users]
  *     summary: 更新用户
  *     security:
- *       - UserId: []
- *         UserName: []
- *         UserRole: []
+ *       - BearerAuth: []
  *     parameters:
  *       - in: path
  *         name: id
@@ -259,9 +251,7 @@ router.put('/:id', requireRole('admin'), async (req, res) => {
  *     tags: [Users]
  *     summary: 删除用户
  *     security:
- *       - UserId: []
- *         UserName: []
- *         UserRole: []
+ *       - BearerAuth: []
  *     parameters:
  *       - in: path
  *         name: id
@@ -296,9 +286,7 @@ router.delete('/:id', requireRole('admin'), async (req, res) => {
  *     summary: 重置用户密码
  *     description: 仅管理员可操作，重置为默认密码 123456
  *     security:
- *       - UserId: []
- *         UserName: []
- *         UserRole: []
+ *       - BearerAuth: []
  *     parameters:
  *       - in: path
  *         name: id
@@ -333,9 +321,7 @@ router.patch('/:id/reset-password', requireRole('admin'), async (req, res) => {
  *     tags: [Users]
  *     summary: 切换用户状态
  *     security:
- *       - UserId: []
- *         UserName: []
- *         UserRole: []
+ *       - BearerAuth: []
  *     parameters:
  *       - in: path
  *         name: id

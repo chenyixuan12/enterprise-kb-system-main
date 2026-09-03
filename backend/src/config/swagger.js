@@ -12,26 +12,13 @@ function toSwaggerGlob(...segments) {
 }
 
 const authDoc = `
-## 鉴权约定（教学演示版）
+## 鉴权约定
 
-本项目**不使用 JWT/Session**，登录后由前端在每次请求中携带以下自定义请求头：
+调用 \`POST /api/auth/login\` 后，从响应中取得 \`accessToken\` 和 \`refreshToken\`。除登录、刷新令牌和健康检查以外的接口都需要携带：
 
-| 请求头 | 说明 | 示例 |
-|--------|------|------|
-| \`x-user-id\` | 用户 MongoDB \`_id\` | \`674a1b2c3d4e5f6789012345\` |
-| \`x-user-name\` | 用户名 | \`admin\` |
-| \`x-user-role\` | 角色，\`admin\` 或 \`user\` | \`admin\` |
+\`Authorization: Bearer <accessToken>\`
 
-**流程：**
-1. 调用 \`POST /api/auth/login\` 获取用户信息
-2. 前端将用户信息存入 \`localStorage.enterpriseUser\`
-3. Axios/Fetch 拦截器自动注入上述三个请求头
-
-**注意：** 请求头可被客户端伪造，仅适用于教学演示；生产环境应改用 JWT 等标准鉴权方案。
-
-**权限说明：**
-- 标注 \`admin\` 的接口需 \`x-user-role: admin\`
-- 未标注的接口通常无需登录，但部分操作会读取 \`x-user-id\` 记录操作者
+访问令牌默认有效期为 30 分钟，失效后调用 \`POST /api/auth/refresh\` 使用 refresh token 换取新令牌。管理员接口还要求令牌中的角色为 \`admin\`。
 `;
 
 const sseDoc = `
@@ -74,9 +61,7 @@ data: {"answer":"完整答案","sessionId":"...","sources":[...]}
 \`\`\`bash
 curl -N -X POST http://localhost:3000/api/qa/ask \\
   -H "Content-Type: application/json" \\
-  -H "x-user-id: YOUR_USER_ID" \\
-  -H "x-user-name: admin" \\
-  -H "x-user-role: admin" \\
+  -H "Authorization: Bearer ACCESS_TOKEN" \\
   -d '{"question":"如何请假？","categoryId":"CATEGORY_ID"}'
 \`\`\`
 `;
@@ -116,23 +101,11 @@ const options = {
     ],
     components: {
       securitySchemes: {
-        UserId: {
-          type: 'apiKey',
-          in: 'header',
-          name: 'x-user-id',
-          description: '登录用户的 MongoDB _id'
-        },
-        UserName: {
-          type: 'apiKey',
-          in: 'header',
-          name: 'x-user-name',
-          description: '登录用户名'
-        },
-        UserRole: {
-          type: 'apiKey',
-          in: 'header',
-          name: 'x-user-role',
-          description: '用户角色：admin 或 user'
+        BearerAuth: {
+          type: 'http',
+          scheme: 'bearer',
+          bearerFormat: 'JWT',
+          description: '登录接口返回的 access token'
         }
       },
       schemas: {

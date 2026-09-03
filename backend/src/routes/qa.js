@@ -4,9 +4,11 @@ import KnowledgeDocument from '../models/KnowledgeDocument.js';
 import KnowledgeCategory from '../models/knowledgeCategory.js';
 import ChatSession from '../models/ChatSession.js';
 import QALog from '../models/QALog.js';
-import { generateAnswer, generateAnswerStream, embedQuery } from '../services/ollamaService.js';
+import { generateAnswerStream, embedQuery } from '../services/ollamaService.js';
 import { queryChunks } from '../services/chromaService.js';
 import { retrieveByBM25, fuseRanks, tokenize } from '../services/bm25Service.js';
+import { rerankChunks } from '../services/rerankService.js';
+import { config } from '../config/env.js';
 import { getRequestUser } from '../utils/auth.js';
 
 const router = Router();
@@ -19,8 +21,12 @@ const RECOMMENDATION_MIN_SCORE = LOW_MATCH_THRESHOLD;
 // 召回阶段各路的候选条数：稠密向量和 BM25 都先多取一些，再融合精排到最终 topK。
 const DENSE_RECALL_K = 30;
 const BM25_RECALL_K = 30;
+// RRF 融合后的候选条数：先保留更多候选，交给重排模型精排后再截断到最终 topK。
+const RERANK_RECALL_K = 15;
 // 只有当稠密相似度达到该值才算“语义上确实相关”，避免只靠标题关键词误判。
 const DENSE_CONFIRM_THRESHOLD = 0.5;
+// 重排分达到该值视为强相关证据（gte-rerank 类模型分数通常在 0~1）。
+const RERANK_CONFIRM_THRESHOLD = 0.5;
 // LLM 答不出内容时常见的兜底短语，命中后视为当前知识库未真正回答，转而推荐其他知识库。
 const NON_ANSWER_MARKERS = ['无法确定', '暂时无法', '没有找到', '未找到', '暂未找到', '找不到', '无法回答', '没有相关', '未提及', '暂无法', '没有信息', '无相关内容'];
 
@@ -246,13 +252,36 @@ function buildHybridCandidates(question, docs, { vectorHits = [], bm25Hits = [] 
   });
 }
 
+// 对融合后的候选做重排精排；未配置重排服务或调用失败时回退为 RRF 顺序截断。
+async function rerankIfEnabled(question, fusedChunks, topK = MAX_RECALL_CHUNKS) {
+  if (!fusedChunks || fusedChunks.length === 0) return [];
+  if (!config.rerankEnabled || fusedChunks.length <= 1) {
+    return fusedChunks.slice(0, topK);
+  }
+  try {
+    const reranked = await rerankChunks(question, fusedChunks, { topK });
+    console.log('[QA] 重排完成', reranked.map((c) => ({
+      chunkId: c.id,
+      title: c.metadata?.title,
+      rerankScore: c.rerankScore
+    })));
+    return reranked;
+  } catch (error) {
+    console.error('[QA] 重排失败，回退 RRF 排序:', error?.message || error);
+    return fusedChunks.slice(0, topK);
+  }
+}
+
 // 判断当前知识库的召回结果是否足以回答：
 // - 稠密相似度足够高（>= DENSE_CONFIRM_THRESHOLD）说明语义上确实相关；
+// - 或者重排分足够高（>= RERANK_CONFIRM_THRESHOLD）说明交叉编码器判定强相关；
 // - 或者稠密分不低且查询关键词能回到答案片段（含 BM25 命中）。
 function hasAnswerEvidence(denseHits, fusedChunks, question) {
   if (!denseHits.length) return false;
 
   const bestDense = Math.max(...denseHits.map((hit) => Number(hit.score || 0)));
+  const rerankScores = fusedChunks.map((chunk) => Number(chunk.rerankScore || 0));
+  const bestRerank = rerankScores.length ? Math.max(...rerankScores) : 0;
   const bm25Scores = fusedChunks.map((chunk) => Number(chunk.bm25Score || 0));
   const bestBm25 = bm25Scores.length ? Math.max(...bm25Scores) : 0;
 
@@ -272,8 +301,11 @@ function hasAnswerEvidence(denseHits, fusedChunks, question) {
   // 2) 关键词命中比例过低，说明问题与当前片段内容无关，判定无答案。
   if (overlapRatio < 0.5) return false;
 
-  // 语义足够强，或关键词命中足够多，或 BM25 有得分，满足其一即可认为有答案。
-  return bestDense >= DENSE_CONFIRM_THRESHOLD || overlapRatio >= 0.75 || bestBm25 > 0;
+  // 语义足够强、重排分足够高、关键词命中足够多，或 BM25 有得分，满足其一即可认为有答案。
+  return bestDense >= DENSE_CONFIRM_THRESHOLD
+    || bestRerank >= RERANK_CONFIRM_THRESHOLD
+    || overlapRatio >= 0.75
+    || bestBm25 > 0;
 }
 
 // 当前知识库没有可靠结果时，在其他知识库中找出最相关的一个作为切换建议。
@@ -316,9 +348,7 @@ async function findAlternativeRecommendation(question, currentCategoryId, allDoc
  *
  *       详细协议说明见文档首页「SSE 流式问答协议」章节。
  *     security:
- *       - UserId: []
- *         UserName: []
- *         UserRole: []
+ *       - BearerAuth: []
  *     requestBody:
  *       required: true
  *       content:
@@ -406,7 +436,11 @@ router.post('/ask', async (req, res) => {
           return [];
         })
       ]);
-      fusedChunks = fuseRanks(currentDenseHits, currentBm25Hits, MAX_RECALL_CHUNKS);
+      fusedChunks = await rerankIfEnabled(
+        question.trim(),
+        fuseRanks(currentDenseHits, currentBm25Hits, RERANK_RECALL_K),
+        MAX_RECALL_CHUNKS
+      );
       currentHasGoodMatch = hasAnswerEvidence(currentDenseHits, fusedChunks, question.trim());
       console.log('[QA] 当前知识库召回', {
         denseHits: currentDenseHits.length,
@@ -420,7 +454,11 @@ router.post('/ask', async (req, res) => {
         queryChunks(questionEmbedding, { topK: DENSE_RECALL_K }).catch(() => []),
         retrieveByBM25(question.trim(), { topK: BM25_RECALL_K }).catch(() => [])
       ]);
-      fusedChunks = fuseRanks(globalDense, globalBm25, MAX_RECALL_CHUNKS);
+      fusedChunks = await rerankIfEnabled(
+        question.trim(),
+        fuseRanks(globalDense, globalBm25, RERANK_RECALL_K),
+        MAX_RECALL_CHUNKS
+      );
       currentHasGoodMatch = fusedChunks.length > 0;
     }
 
@@ -430,7 +468,8 @@ router.post('/ask', async (req, res) => {
       title: chunk.metadata?.title,
       denseScore: chunk.denseScore,
       bm25Score: chunk.bm25Score,
-      fusedScore: chunk.fusedScore
+      fusedScore: chunk.fusedScore,
+      rerankScore: chunk.rerankScore
     })));
 
     // 2) 当前知识库回答不了时，自动路由到最相关的其他知识库，重新检索并直接回答。
@@ -458,7 +497,11 @@ router.post('/ask', async (req, res) => {
           })
         ]);
 
-        const routedFusedChunks = fuseRanks(routedDenseHits, routedBm25Hits, MAX_RECALL_CHUNKS);
+        const routedFusedChunks = await rerankIfEnabled(
+          question.trim(),
+          fuseRanks(routedDenseHits, routedBm25Hits, RERANK_RECALL_K),
+          MAX_RECALL_CHUNKS
+        );
         const routedHasGoodMatch = hasAnswerEvidence(routedDenseHits, routedFusedChunks, question.trim());
 
         if (routedHasGoodMatch) {

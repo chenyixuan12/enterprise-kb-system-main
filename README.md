@@ -1,8 +1,9 @@
 # Enterprise AIKB
-# 当前版本：V2 — 完整 RAG 主链路 + BM25/向量混合检索（RRF 融合）+ 跨知识库自动路由。
-企业内部知识库智能问答系统。项目基于 RAG（检索增强生成）实现企业制度、产品指南等文档的可追溯问答，支持文档上传、语义切块、本地向量化、Chroma 检索、流式回答与引用来源展示。
 
+企业内部知识库智能问答系统。基于 RAG（检索增强生成）实现企业制度、产品指南等文档的可追溯问答，支持文档上传、语义切块、本地向量化、Chroma 检索、流式回答与引用来源展示。
 
+**当前版本：V2（完整 RAG 主链路）**  
+✅ 文档解析与索引 / 混合检索（BM25 + 向量 + RRF 融合） / 可选 Cross-Encoder 重排 / 答案证据判断与跨知识库自动路由 / 流式 SSE 问答 / 会话与日志 / Swagger 接口文档 / 角色权限管理
 
 ## 功能概览
 
@@ -10,12 +11,15 @@
 - **文档解析**：支持 `txt`、`md`、`pdf`、`docx` 文件上传，以及手动录入富文本内容。
 - **自动索引**：文档入库后自动解析、按自然语义边界切块、生成 embedding 并写入向量库。
 - **RAG 问答**：按当前选择的知识库召回相关 Chunk，将上下文交给大模型生成答案。
-- **混合检索（BM25 + 向量 + RRF）**：Chroma 稠密向量与 BM25 稀疏检索双路召回，RRF 融合排序，降低跨主题误召回。
+- **混合检索（BM25 + 向量 + RRF + 可选 Rerank）**：Chroma 稠密向量与 BM25 稀疏检索双路召回，先用 RRF 融合，再通过可选 Cross-Encoder 对候选片段重排，降低跨主题误召回并提升相关性。
+- **答案证据判断**：通过稠密相似度、重排分数、关键词命中率、BM25 得分多维度判定当前知识库是否有可靠答案。
+- **跨知识库自动路由**：当前知识库无可靠答案时，自动检索最相关的其他知识库并直接回答，无需手动切换。
 - **来源追溯**：回答下方展示命中文档、文本片段与相关度。
 - **流式输出**：通过 SSE 将大模型回答实时推送到前端。
 - **会话与日志**：保存对话历史、问答日志与回答来源。
-- **跨知识库自动路由**：当前知识库无可靠答案时，自动检索最相关的其他知识库并直接回答，无需手动切换。
 - **AI 补全**：编辑知识内容时可调用大模型辅助补全文本。
+- **角色权限管理**：管理员与普通用户两级权限，支持用户管理。
+- **Swagger 接口文档**：`/api-docs` 提供交互式 API 文档，支持在线测试。
 
 ## RAG 架构
 
@@ -45,10 +49,19 @@ Chroma：保存 Chunk 向量、文本与来源元数据
         └── MongoDB Chunk BM25 稀疏召回
                 │
                 ▼
-        RRF 融合排序 → TopK Chunk
+        RRF 融合排序 → TopK 候选
                 │
                 ▼
-        答案证据判断（无可靠答案时自动路由到其他知识库重新召回）
+     ┌─ 可选 Cross-Encoder 重排 ─┐
+     │（Aliyun DashScope / Jina / │
+     │  Xinference 等）           │
+     └──────────┬─────────────────┘
+                │
+                ▼
+    答案证据判断（多维度阈值判定）
+        │
+        ├── 有可靠答案 → 当前知识库回答
+        └── 无可靠答案 → 跨知识库自动路由 → 重新召回
                 │
                 ▼
         问题 + 上下文 → LLM 流式生成 → 来源片段展示
@@ -58,21 +71,28 @@ Chroma：保存 Chunk 向量、文本与来源元数据
 
 ### 前端
 
-- Vue 3
-- Vite
-- Element Plus
+- Vue 3 + Vue Router 4
+- Vite 8
+- Element Plus 2
 - Axios
-- ECharts
+- ECharts 6 + vue-echarts
 - ESLint + Prettier
+- Sass
+- SparkMD5（文件分片上传校验）
 
 ### 后端与数据服务
 
-- Node.js + Express
-- MongoDB + Mongoose
+- Node.js 20+ Express 5
+- MongoDB 7 + Mongoose
 - Chroma（向量数据库）
 - Ollama（本地 Embedding 服务）
-- 外部 OpenAI-compatible LLM API（回答生成 / AI 补全）
+- 外部 LLM API（支持 DeepSeek / Alibaba / Ollama 等 OpenAI-compatible 接口）
+- BM25 中文分词检索（segmentit）
+- Cross-Encoder Rerank（支持 Aliyun DashScope / Jina / Xinference 等）
 - Multer、`pdf-parse`、Mammoth（文件上传与文本解析）
+- Swagger (swagger-jsdoc + swagger-ui-express) 接口文档
+- Helmet + express-rate-limit 安全加固
+- JSON Web Token 鉴权
 
 ## 项目结构
 
@@ -80,22 +100,31 @@ Chroma：保存 Chunk 向量、文本与来源元数据
 enterprise-kb-system-main/
 ├─ frontend/                         # Vue 前端
 │  └─ src/
-│     ├─ views/                      # 页面级视图
+│     ├─ views/                      # 页面级视图（10 个页面）
 │     ├─ components/                 # 通用组件
 │     └─ api/                        # HTTP / SSE 接口封装
 ├─ backend/                          # Express 后端
 │  └─ src/
-│     ├─ config/                     # 环境配置
-│     ├─ models/                     # MongoDB 模型
+│     ├─ config/                     # 环境配置 / Swagger 定义
+│     ├─ controllers/                # 分类控制器
+│     ├─ models/                     # MongoDB 模型（User / Category / Document / Chunk / ChatSession / QALog）
 │     ├─ routes/                     # API 路由
 │     ├─ services/
 │     │  ├─ documentService.js       # 文本提取与语义切块
 │     │  ├─ knowledgeIndexService.js # 文档索引管线
+│     │  ├─ knowledgeIndexQueue.js   # 索引队列调度
+│     │  ├─ knowledgeUploadProcessor.js # 上传文件处理
 │     │  ├─ chromaService.js         # Chroma 向量读写
 │     │  ├─ bm25Service.js           # BM25 稀疏检索 + RRF 融合
+│     │  ├─ rerankService.js         # Cross-Encoder 重排（Aliyun / Jina / 通用）
 │     │  └─ ollamaService.js         # Embedding / LLM 调用
-│     └─ utils/
+│     ├─ scripts/                    # reindexAll 等运维脚本
+│     ├─ seed/                       # 种子数据初始化
+│     └─ utils/                      # 鉴权 / 数据库连接
 ├─ chroma-data/                      # 本地 Chroma 数据目录（运行后生成）
+├─ docs/                             # 项目文档与笔记
+├─ docker-compose.yml                # 一键部署配置
+├─ .env.example                      # Docker Compose 环境变量模板
 └─ README.md
 ```
 
@@ -107,7 +136,7 @@ enterprise-kb-system-main/
 
 确保本机已安装：
 
-- Node.js 18+
+- Node.js 20+
 - npm
 - MongoDB
 - Ollama
@@ -171,8 +200,19 @@ Invoke-RestMethod http://127.0.0.1:8000/api/v2/heartbeat
 SERVER_PORT=3000
 NODE_ENV=development
 
+# 浏览器跨域白名单。生产环境只填写实际前端域名，多个域名以英文逗号分隔。
+CORS_ORIGINS=http://localhost:5173,http://localhost
+# 生产环境默认关闭接口文档；仅在受控内网排障时设为 true。
+API_DOCS_ENABLED=true
+
+# MongoDB 连接地址
 MONGODB_URI=mongodb://localhost:27017/db_enterprise_qa
 MONGODB_CONNECT_TIMEOUT=30000
+
+# JWT 签名密钥（必填，请使用足够长的随机字符串）
+JWT_SECRET=please_change_me_to_a_long_random_string
+# Token 有效期，默认 7 天
+JWT_EXPIRES_IN=7d
 
 # Chroma 本地服务
 CHROMA_BASE_URL=http://127.0.0.1:8000
@@ -187,13 +227,23 @@ EMBEDDING_BASE_URL=http://127.0.0.1:11434
 EMBEDDING_API_KEY=
 EMBEDDING_MODEL_NAME=nomic-embed-text
 
-# 回答生成模型：按供应商接口填写
-LLM_PROVIDER=aliyun
-LLM_BASE_URL=https://your-api-host/compatible-mode
+# 回答生成模型（支持 deepseek / alibaba / ollama）
+LLM_PROVIDER=deepseek
+LLM_BASE_URL=https://api.deepseek.com
 LLM_API_KEY=your_api_key_here
-LLM_MODEL_NAME=your_model_name
+LLM_MODEL_NAME=deepseek-v4-pro
 LLM_MAX_TOKENS=2048
 LLM_TEMPERATURE=0.7
+
+# 重排（Rerank）配置（可选）：RRF 融合后对候选片段做交叉编码器精排
+# RERANK_API_KEY 留空时复用 LLM_API_KEY（百炼场景同账号）
+RERANK_ENABLED=false
+RERANK_PROVIDER=aliyun
+RERANK_BASE_URL=https://dashscope.aliyuncs.com
+RERANK_API_KEY=
+RERANK_MODEL_NAME=gte-rerank-v2
+RERANK_THRESHOLD=0.3
+RERANK_TIMEOUT=30000
 
 DEFAULT_USER_PASSWORD=123456
 UPLOAD_FILE_DIR=./uploads
@@ -230,6 +280,10 @@ npm install
 npm run dev
 ```
 
+### 7. 访问接口文档
+
+后端启动后，访问 `http://localhost:3000/api-docs` 查看 Swagger 交互式 API 文档，支持在线测试。接口文档仅在 `API_DOCS_ENABLED=true` 时可用。
+
 ## Docker 部署
 
 项目提供 `docker-compose.yml`，一键编排全部服务（MongoDB、Ollama、Chroma、后端、前端），无需本机安装 Node / Python / MongoDB 等运行时。
@@ -251,20 +305,41 @@ Copy-Item .env.example .env
 打开 `.env`，重点填写以下项：
 
 ```env
-# DeepSeek API Key（必填，用于回答生成）
+# LLM API Key（必填，用于回答生成）
 LLM_API_KEY=your_api_key_here
+LLM_PROVIDER=deepseek
 LLM_BASE_URL=https://api.deepseek.com
 LLM_MODEL_NAME=deepseek-v4-pro
 
-# MongoDB 管理员账号（必填，上线前务必改成强密码，避免默认值）
+# MongoDB 管理员账号（必填，使用唯一账号和强密码）
 MONGO_INITDB_ROOT_USERNAME=kbadmin
-MONGO_INITDB_ROOT_PASSWORD=kbadmin123
+MONGO_INITDB_ROOT_PASSWORD=replace_with_a_long_random_password
 
 # JWT 签名密钥（必填，上线前务必改成足够长的随机字符串）
 JWT_SECRET=please_change_me_to_a_long_random_string
+# Token 有效期，默认 7 天
+JWT_EXPIRES_IN=7d
+
+# 浏览器跨域白名单；生产环境填写实际前端域名
+CORS_ORIGINS=http://localhost:5173,http://localhost
+# 公网环境保持关闭；只在受控内网排障时设为 true
+API_DOCS_ENABLED=false
 
 # 本地 Ollama Embedding（Docker 内无需修改地址，compose 会自动替换为容器地址）
+EMBEDDING_PROVIDER=ollama
+EMBEDDING_BASE_URL=http://127.0.0.1:11434
 EMBEDDING_MODEL_NAME=nomic-embed-text
+
+# 重排（Rerank）配置（可选）：RERANK_API_KEY 留空时复用 LLM_API_KEY
+RERANK_ENABLED=false
+RERANK_PROVIDER=aliyun
+RERANK_BASE_URL=https://dashscope.aliyuncs.com
+RERANK_API_KEY=
+RERANK_MODEL_NAME=gte-rerank-v2
+RERANK_THRESHOLD=0.3
+RERANK_TIMEOUT=30000
+
+DEFAULT_USER_PASSWORD=123456
 ```
 
 > 密码中不要包含 `@`、`:`、`/`、`?` 等 URL 特殊字符，否则 MongoDB 连接串会解析失败。
@@ -288,7 +363,8 @@ docker compose ps
 所有服务均变为 `healthy` 后即可访问：
 
 - 前端页面：<http://localhost>
-- 后端 API：<http://localhost:3000/health>（返回 `OK` 即正常）
+- 后端 API：<http://localhost:3000/health>（返回 `{"message":"ok"}` 即正常）
+- 接口文档：<http://localhost:3000/api-docs>（仅 `API_DOCS_ENABLED=true` 时可用）
 
 ### 4. 拉取 Embedding 模型（首次必须）
 
@@ -341,7 +417,9 @@ docker compose exec backend npm run seed
 ### 8. 注意事项
 
 - `.env` 中的 `LLM_API_KEY`、`MONGO_INITDB_ROOT_PASSWORD`、`JWT_SECRET` 属于敏感信息，请勿提交到 Git。
-- 上线公网前务必修改默认的 `MONGO_INITDB_ROOT_PASSWORD`、`JWT_SECRET` 和管理员账号密码，并确认服务器防火墙只放行 80 端口。
+- 公网部署必须在负载均衡器或反向代理处终止 HTTPS，仅放行 `443`；如保留 `80`，只用于跳转 HTTPS。当前 Compose 提供应用 HTTP 服务，不负责证书签发和续期。
+- 上传文件与 Chroma 数据属于运行数据，必须通过卷备份，不应提交到 Git。
+- `CORS_ORIGINS` 只填写允许访问 API 的前端域名；`API_DOCS_ENABLED` 在公网环境保持 `false`。
 - 更换 `EMBEDDING_MODEL_NAME` 后，旧向量不能混用，需清理 Chroma 数据卷并对所有文档重新索引。
 - 首次 `docker compose up -d` 需要拉取多个基础镜像并构建前端，耗时较长属正常现象。
 - 若前端部署在服务器上需改端口，修改 `docker-compose.yml` 中 `frontend.ports` 的宿主端口映射（如 `8080:80`）。
@@ -359,15 +437,18 @@ docker compose exec backend npm run seed
 当前项目已实现完整的 Naive RAG 主链路，并在此基础上加入了：
 
 ```text
-分类过滤 + Chroma 稠密检索 + BM25 稀疏检索 + RRF 融合 + 答案证据判断 + 跨知识库自动路由
+分类过滤 + Chroma 稠密检索 + BM25 稀疏检索 + RRF 融合 + 可选 Cross-Encoder 重排 + 证据判断 + 跨知识库自动路由
 ```
 
-当前版本定位为 **V2（跨知识库自动路由 / Adaptive RAG 雏形）**，适合标准文本知识库问答场景。后续可按实际问题逐步演进：
+当前版本定位为 **V2（自适应 RAG 雏形）**，适合标准文本知识库问答场景。后续可按实际问题逐步演进：
 
 - **V1 ✅ 已完成**：Naive RAG 主链路 + 文档解析/切块/向量化 + 混合检索 + 流式回答与来源追溯。
 - **V2 ✅ 已实现自动路由**：当前知识库无可靠答案时，自动检索最相关的其他知识库并直接回答（保留跨知识库聚合评分与切换建议）。
 - **V3（未做）**：Multi-Query RAG / Query Rewrite / HyDE，改善口语化、同义词和不完整问题的召回能力。
-- **V4（部分雏形）**：独立 Reranker + Corrective RAG，已加入答案证据判断与无答案兜底，尚未加入 Cross-Encoder 重排与低置信度重检索。
+- **V4 ✅ 已完成**：独立 Cross-Encoder 重排 + 答案证据判断。
+  - 支持 Aliyun DashScope / Jina / Xinference 等 OpenAI-compatible 重排服务。
+  - 重排后通过稠密相似度、重排分数、关键词命中率、BM25 得分多维度判定是否值得回答。
+  - 未配置重排服务或调用失败时自动回退为 RRF 排序。
 - **V5（未做）**：多模态、GraphRAG 或 Agentic RAG。
 
 ## 常用脚本
@@ -375,30 +456,38 @@ docker compose exec backend npm run seed
 ### 根目录
 
 ```bash
-npm run dev
+npm run dev          # 并行启动前后端
+npm run start        # 并行启动（后端生产 + 前端开发）
+npm run build        # 构建前端
+npm run seed         # 初始化种子数据
+npm run deploy       # docker compose up -d --build
+npm run deploy:stop  # docker compose down
+npm run deploy:logs  # docker compose logs -f
 ```
 
 ### 前端
 
 ```bash
-npm run dev
-npm run build
-npm run lint
-npm run lint:fix
-npm run format
-npm run format:check
+npm run dev          # 开发服务器
+npm run build        # 生产构建
+npm run preview      # 预览构建产物
+npm run lint         # ESLint 检查
+npm run lint:fix     # ESLint 自动修复
+npm run format       # Prettier 格式化
+npm run format:check # Prettier 格式检查
 ```
 
 ### 后端
 
 ```bash
-npm run dev
-npm start
-npm run seed
-npm run lint
-npm run lint:fix
-npm run format
-npm run format:check
+npm run dev          # 开发服务器（热重载）
+npm start            # 生产启动
+npm run seed         # 种子数据初始化
+npm run reindex      # 全量重新索引所有文档
+npm run lint         # ESLint 检查
+npm run lint:fix     # ESLint 自动修复
+npm run format       # Prettier 格式化
+npm run format:check # Prettier 格式检查
 ```
 
 ## 注意事项
@@ -407,3 +496,4 @@ npm run format:check
 - 更换 Embedding 模型后，旧向量不应继续混用；请清理或新建 Chroma Collection，并对所有文档重新建立索引。
 - Chroma、Ollama、MongoDB 与后端需要同时运行，文档索引和问答检索才能正常工作。
 - `chroma-data/`、上传文件和 `.env` 均属于本地运行数据，建议加入 `.gitignore`。
+
