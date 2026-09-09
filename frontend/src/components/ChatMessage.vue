@@ -17,17 +17,20 @@
           <el-avatar :size="36" :icon="Monitor" class="ai-icon" />
         </div>
         <div class="bubble ai-bubble">
+          <div v-if="message.answeredByKnowledgeName" class="bubble-kb-tag">
+            <el-icon :size="12"><FolderOpened /></el-icon>
+            依据「{{ message.answeredByKnowledgeName }}」回答
+          </div>
           <div class="message-text">{{ message.content }}</div>
-
         </div>
-      </div>
+     </div>
     </template>
   </div>
-</template>
+</template> 
 
 <script setup>
 import { computed } from 'vue';
-import { User, Monitor } from '@element-plus/icons-vue';
+import { User, Monitor, FolderOpened } from '@element-plus/icons-vue';
 
 const props = defineProps({
   message: {
@@ -106,52 +109,16 @@ const isUser = computed(() => props.message.role === 'user');
   }
 }
 
-.sources {
-  margin-top: 12px;
-  padding-top: 12px;
-  border-top: 1px dashed #e6edf5;
-
-  .sources-title {
-    margin-bottom: 8px;
-    font-size: 12px;
-    color: #8592a6;
-  }
-
-  .sources-list {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-  }
-
-  .source-tag {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    max-width: 100%;
-    padding: 8px 12px;
-    background: #f8fbff;
-    border: 1px solid #dce7f3;
-    border-radius: 10px;
-    font-size: 12px;
-    color: #4b5563;
-    cursor: pointer;
-    transition: all 0.2s ease;
-
-    &:hover {
-      background: #eef6ff;
-      border-color: #c9ddf6;
-      transform: translateY(-1px);
-    }
-  }
-
-  .source-snippet {
-    color: #7b8794;
-    line-height: 1.6;
-  }
-
-  .source-score {
-    color: #4f8fe8;
-    font-size: 11px;
-  }
+.bubble-kb-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 8px;
+  padding: 2px 10px;
+  background: rgba(64, 158, 255, 0.08);
+  border: 1px solid rgba(64, 158, 255, 0.2);
+  border-radius: 999px;
+  font-size: 12px;
+  color: #2d7fe8;
 }
 </style>

@@ -175,15 +175,25 @@ export async function generateAnswer(prompt) {
   return answer;
 }
 
-export async function generateAnswerStream(prompt, onChunk) {
+export async function generateAnswerStream(prompt, onChunk, { historyMessages = [] } = {}) {
   const { provider, baseUrl, apiKey, modelName } = getProviderConfig('llm');
   const chatUrl = getChatUrl(provider, baseUrl);
 
-  console.log('[LLM] 准备调用大模型 (流式)', { provider, model: modelName, promptLength: String(prompt || '').length });
+  // 有历史对话时按 messages 数组发给 LLM，让模型利用多轮语境；历史最后必须是 user 消息（即当前问题）。
+  const messages = Array.isArray(historyMessages) && historyMessages.length
+    ? [
+        ...historyMessages
+          .filter((item) => item?.role && item?.content && ['user', 'assistant'].includes(item.role))
+          .map((item) => ({ role: item.role, content: String(item.content) })),
+        { role: 'user', content: prompt }
+      ]
+    : [{ role: 'user', content: prompt }];
+
+  console.log('[LLM] 准备调用大模型 (流式)', { provider, model: modelName, promptLength: String(prompt || '').length, historyCount: messages.length - 1 });
 
   const payload = provider === 'ollama'
-    ? { model: modelName, messages: [{ role: 'user', content: prompt }], stream: true, options: { temperature: config.llmTemperature, num_predict: config.llmMaxTokens } }
-    : { model: modelName, messages: [{ role: 'user', content: prompt }], temperature: config.llmTemperature, max_tokens: config.llmMaxTokens, stream: true };
+    ? { model: modelName, messages, stream: true, options: { temperature: config.llmTemperature, num_predict: config.llmMaxTokens } }
+    : { model: modelName, messages, temperature: config.llmTemperature, max_tokens: config.llmMaxTokens, stream: true };
 
   const fullAnswer = await requestStream(chatUrl, { apiKey, provider, payload, onChunk });
 

@@ -385,8 +385,14 @@ function inlineMarkdown(text = '') {
     });
 }
 
+function normalizePreviewText(text = '') {
+  return String(text || '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/&lt;br\s*\/?&gt;/gi, '\n');
+}
+
 function renderMarkdown(text = '') {
-  const lines = String(text || '').replace(/\r\n/g, '\n').split('\n');
+  const lines = normalizePreviewText(text).replace(/\r\n/g, '\n').split('\n');
   const html = [];
   let inCode = false;
   let codeLines = [];
@@ -462,11 +468,24 @@ function renderMarkdown(text = '') {
   return html.join('\n');
 }
 
+function normalizeRenderableText(value = '') {
+  const text = String(value || '');
+  if (!text) return '';
+
+  const hasHtmlTags = /<(?:br|p|div|section|article|aside|header|footer|main|nav|blockquote|pre|code|ul|ol|li|h[1-6]|strong|b|em|i)\b/i.test(text);
+  if (!hasHtmlTags) return text;
+
+  const container = document.createElement('div');
+  container.innerHTML = text;
+  return (container.innerText || container.textContent || '').replace(/\u00a0/g, ' ');
+}
+
 const renderedHtml = computed(() => {
+  const normalizedText = normalizeRenderableText(textContent.value);
   if (fileType.value === 'md') {
-    return renderMarkdown(textContent.value);
+    return renderMarkdown(normalizedText);
   }
-  return escapeHtml(textContent.value).replace(/\n/g, '<br />');
+  return escapeHtml(normalizedText).replace(/\n/g, '<br />');
 });
 
 watch(

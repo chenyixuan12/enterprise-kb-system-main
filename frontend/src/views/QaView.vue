@@ -45,8 +45,12 @@
             <span v-if="selectedKnowledgeDB" class="query-pill">
               <el-icon :size="16" color="#67c23a"><Search /></el-icon>
               正在查询：<strong>{{ selectedKnowledgeDB.name }}</strong>
+              <template v-if="answeringKnowledgeDB  && String(answeringKnowledgeDB._id) !== String(selectedKnowledgeDB._id)">
+                <span class="pill-sep">→</span>
+                <span class="pill-sub">已切换至：<strong>{{ answeringKnowledgeDB.name }}</strong></span>
+              </template>
             </span>
-            <span v-else class="query-hint">请先从左侧选择一个知识库</span>
+            <span v-if="!selectedKnowledgeDB" class="query-hint">请先从左侧选择一个知识库</span>
           </div>
 
           <div class="qa-header-actions">
@@ -183,6 +187,7 @@
 <script setup>
 import { ref, onMounted, nextTick, watch } from 'vue';
 import { useRoute } from 'vue-router';
+import { ElMessage } from 'element-plus';
 import { Menu, FolderOpened, Search, ChatDotSquare, Monitor, ArrowRight, Plus, Warning } from '@element-plus/icons-vue';
 import ChatMessage from '../components/ChatMessage.vue';
 import { apiFetch, apiFetchStream } from '../api/http.js';
@@ -200,6 +205,7 @@ const abortController = ref(null);
 const mismatchHint = ref(null);
 const recommendedKbs = ref([]);
 const topRecommendedKb = ref(null);
+const answeringKnowledgeDB = ref(null);
 const route = useRoute();
 const lastQuestion = ref('');
 
@@ -211,6 +217,7 @@ function createNewSession() {
   mismatchHint.value = null;
   recommendedKbs.value = [];
   topRecommendedKb.value = null;
+  answeringKnowledgeDB.value = null;
   question.value = '';
 }
 
@@ -218,9 +225,9 @@ function getSessionStorageKey(categoryId) {
   return categoryId ? `qa-session-${categoryId}` : 'qa-session-global';
 }
 
-function persistSessionId(value) {
-  if (!selectedKnowledgeDB.value) return;
-  const key = getSessionStorageKey(selectedKnowledgeDB.value._id);
+function persistSessionId(value, categoryId = selectedKnowledgeDB.value?._id) {
+  if (!categoryId) return;
+  const key = getSessionStorageKey(categoryId);
   if (value) localStorage.setItem(key, value);
   else localStorage.removeItem(key);
 }
@@ -238,6 +245,7 @@ function clearCurrentChatState() {
   mismatchHint.value = null;
   recommendedKbs.value = [];
   topRecommendedKb.value = null;
+  answeringKnowledgeDB.value = null;
 }
 
 function abortQuestion() {
@@ -293,11 +301,16 @@ async function loadSessionHistory(sessionIdParam) {
   }
 }
 
-function selectKnowledgeDB(item) {
+function selectKnowledgeDB(item, { silent = false } = {}) {
+  const previousId = selectedKnowledgeDB.value?._id;
   selectedKnowledgeDB.value = item;
   clearCurrentChatState();
   sessionId.value = restoreSessionId(item._id);
   question.value = lastQuestion.value || '';
+
+  if (!silent && previousId && String(previousId) !== String(item._id)) {
+    ElMessage.success(`已切换到「${item.name}」知识库`);
+  }
 }
 
 function switchToRecommendedKnowledge(kb) {
@@ -349,8 +362,16 @@ async function sendQuestion() {
             (item) => String(item._id) === String(matchedKnowledgeId)
           );
           if (matchedKnowledge) {
+            // 静默切换：只更新选中库与会话状态，保留当前消息流，等待后续 chunk/done
+            const previousId = selectedKnowledgeDB.value?._id;
             selectedKnowledgeDB.value = matchedKnowledge;
+            answeringKnowledgeDB.value = matchedKnowledge;
+            sessionId.value = restoreSessionId(matchedKnowledge._id);
+            if (previousId && String(previousId) !== String(matchedKnowledge._id)) {
+              ElMessage.success(`已自动切换到「${matchedKnowledge.name}」知识库`);
+            }
           }
+          mismatchHint.value = data || null;
           recommendedKbs.value = [];
           topRecommendedKb.value = null;
           return;
@@ -370,14 +391,22 @@ async function sendQuestion() {
       },
       onDone(data) {
         const answerText = data.answer || currentAnswer.value;
+        const answeredName = data.answeredByKnowledge || answeringKnowledgeDB.value?.name || '';
         messages.value.push({
           role: 'ai',
           content: answerText,
-          sources: data.sources || currentSources.value
+          sources: data.sources || currentSources.value,
+          answeredByKnowledgeName: answeredName
         });
         if (data.sessionId) {
           sessionId.value = data.sessionId;
-          persistSessionId(data.sessionId);
+          persistSessionId(data.sessionId, data.answeredByKnowledgeId || selectedKnowledgeDB.value?._id);
+        }
+        if (data.answeredByKnowledgeId) {
+          const answered = knowledgeDBs.value.find((item) => String(item._id) === String(data.answeredByKnowledgeId));
+          answeringKnowledgeDB.value = answered || selectedKnowledgeDB.value;
+        } else {
+          answeringKnowledgeDB.value = null;
         }
         if (Array.isArray(data.recommendedKnowledge) && data.recommendedKnowledge.length) {
           recommendedKbs.value = data.recommendedKnowledge;
@@ -388,6 +417,9 @@ async function sendQuestion() {
               suggestedKnowledge: data.suggestedKnowledge || '',
               suggestedKnowledgeId: data.suggestedKnowledgeId || ''
             };
+          }
+          if (!data?.autoSwitched && topRecommendedKb.value && data?.suggestedKnowledgeId) {
+            ElMessage.info(`建议切换到「${data.suggestedKnowledge || topRecommendedKb.value.name}」知识库`);
           }
         }
         if (answerText?.includes('根据当前知识库内容暂时无法确定')) {
@@ -413,6 +445,7 @@ async function sendQuestion() {
         abortController.value = null;
         currentAnswer.value = '';
         currentSources.value = [];
+        answeringKnowledgeDB.value = null;
         scrollToBottom();
       }
     });
@@ -428,6 +461,7 @@ async function sendQuestion() {
     abortController.value = null;
     currentAnswer.value = '';
     currentSources.value = [];
+    answeringKnowledgeDB.value = null;
     scrollToBottom();
   }
 }
@@ -634,6 +668,20 @@ onMounted(async () => {
 
 .query-pill strong {
   color: #1d4ed8;
+}
+
+.query-pill .pill-sep {
+  margin: 0 6px;
+  color: #94a3b8;
+}
+
+.query-pill .pill-sub {
+  color: #334155;
+  font-weight: 500;
+}
+
+.query-pill .pill-sub strong {
+  color: #2d7fe8;
 }
 
 .query-hint {

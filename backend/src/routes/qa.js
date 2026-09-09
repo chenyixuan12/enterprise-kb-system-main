@@ -4,7 +4,7 @@ import KnowledgeDocument from '../models/KnowledgeDocument.js';
 import KnowledgeCategory from '../models/knowledgeCategory.js';
 import ChatSession from '../models/ChatSession.js';
 import QALog from '../models/QALog.js';
-import { generateAnswerStream, embedQuery } from '../services/ollamaService.js';
+import { generateAnswer, generateAnswerStream, embedQuery } from '../services/ollamaService.js';
 import { queryChunks } from '../services/chromaService.js';
 import { retrieveByBM25, fuseRanks, tokenize } from '../services/bm25Service.js';
 import { rerankChunks } from '../services/rerankService.js';
@@ -15,6 +15,9 @@ const router = Router();
 const MAX_RECALL_CHUNKS = 5;
 const MAX_SOURCE_DOCS = 3;
 const MAX_CONTEXT_CHARS = 6000;
+// 多轮上下文：发给 LLM 的最近对话轮数上限与改写用的轮数上限。
+const MAX_HISTORY_MESSAGES = 8;
+const REWRITE_HISTORY_TURNS = 3;
 const SOURCE_SCORE_THRESHOLD = 0.2;
 const LOW_MATCH_THRESHOLD = 4;
 const RECOMMENDATION_MIN_SCORE = LOW_MATCH_THRESHOLD;
@@ -147,12 +150,87 @@ function buildContext(chunksWithContent) {
   return output.trim();
 }
 
-function buildPrompt(question, context) {
+function buildPrompt(question, context, { historyMessages = [], rewrittenQuestion = '' } = {}) {
+  const historyBlock = historyMessages.length
+    ? `\n\n【最近对话（时间从旧到新）】\n${historyMessages
+        .map((item) => `${item.role === 'user' ? '用户' : '助手'}：${item.content}`)
+        .join('\n')}\n`
+    : '';
+  const questionBlock = rewrittenQuestion && rewrittenQuestion !== question
+    ? `（该问题可能指代最近对话中的内容，独立完整表述为：${rewrittenQuestion}）\n\n用户问题：${question}`
+    : `用户问题：${question}`;
+
   if (!context) {
-    return `你是企业内部知识库的可对话专家 Agent。\n请严格基于给定的知识内容回答用户问题，不要编造。\n如果知识内容不足，请明确说明“根据当前知识库内容暂时无法确定”。\n\n当前知识库中没有检索到相关内容。\n\n用户问题：${question}\n\n请直接给出中文答案。`;
+    return `你是企业内部知识库的可对话专家 Agent。\n请严格基于给定的知识内容回答用户问题，不要编造。\n如果知识内容不足，请明确说明“根据当前知识库内容暂时无法确定”。\n${historyBlock}\n当前知识库中没有检索到相关内容。\n\n${questionBlock}\n\n请直接给出中文答案。`;
   }
 
-  return `你是企业内部知识库的可对话专家 Agent。\n请严格基于以下知识内容回答用户问题，不要编造。\n如果知识内容不足，请明确说明“根据当前知识库内容暂时无法确定”。\n\n知识内容：\n${context}\n\n用户问题：${question}\n\n请直接给出中文答案。`;
+  return `你是企业内部知识库的可对话专家 Agent。\n请严格基于以下知识内容回答用户问题，不要编造。\n如果知识内容不足，请明确说明“根据当前知识库内容暂时无法确定”。\n${historyBlock}\n知识内容：\n${context}\n\n${questionBlock}\n\n请直接给出中文答案。`;
+}
+
+// 读取会话历史：截取最近 N 条，转换为 LLM 消息格式。
+async function loadSessionHistoryMessages(sessionId) {
+  if (!sessionId || !mongoose.Types.ObjectId.isValid(sessionId)) return [];
+  try {
+    const session = await ChatSession.findById(sessionId).select('history').lean();
+    const history = Array.isArray(session?.history) ? session.history : [];
+    return history
+      .slice(-MAX_HISTORY_MESSAGES)
+      .filter((item) => item?.role && item?.content)
+      .map((item) => ({ role: item.role, content: String(item.content) }));
+  } catch (error) {
+    console.error('[QA] 读取会话历史失败:', error?.message || error);
+    return [];
+  }
+}
+
+// 判断当前问题是否依赖上一轮语境（含指代词、省略主语或明显偏短）。
+function needsRewrite(question, historyMessages) {
+  if (!historyMessages.length || !question) return false;
+  const text = String(question).trim();
+  if (text.length <= 6) return true;
+  return /(那|这|它|他|她|其|该|此|上面|前面|刚才|上一|继续|再|还|同样|一样|呢|呢？|呢?)/.test(text)
+    || /[它他她]们?的|上述|以上|前面提到|刚刚|第[一二三四五六七八九十\d]+[条个步种项]/.test(text);
+}
+
+// 问题改写：结合最近几轮对话，把追问/指代补全成独立完整的问题；失败时回退原问题。
+async function rewriteQuestion(question, historyMessages) {
+  const trimmed = String(question || '').trim();
+  if (!needsRewrite(trimmed, historyMessages)) return { question: trimmed, rewritten: false };
+
+  const recentTurns = historyMessages.slice(-REWRITE_HISTORY_TURNS * 2);
+  if (!recentTurns.length) return { question: trimmed, rewritten: false };
+
+  const historyText = recentTurns
+    .map((item) => `${item.role === 'user' ? '用户' : '助手'}：${item.content}`)
+    .join('\n');
+
+  const prompt = `你是一个搜索查询优化器。请根据最近对话，把用户最新的追问改写成一个不依赖上下文、可独立用于知识库检索的完整问题。
+
+要求：
+1. 只输出了改写后的问题本身，不要解释、不要加引号。
+2. 保留用户提问的原意，补全其中的代词（如“它”“那个”）所指的对象。
+3. 若最新问题本身已经完整，与改写结果相同，则原样输出。
+4. 不要添加对话中不存在的信息，不要编造。
+
+最近对话：
+${historyText}
+
+用户最新问题：${trimmed}
+
+改写后的问题：`;
+
+  try {
+    const rewritten = String(await generateAnswer(prompt) || '')
+      .replace(/^["'“”\s]+|["'“”\s]+$/g, '')
+      .split('\n')[0]
+      .trim();
+    if (!rewritten) return { question: trimmed, rewritten: false };
+    console.log('[QA] 问题改写', { original: trimmed, rewritten });
+    return { question: rewritten, rewritten: true };
+  } catch (error) {
+    console.error('[QA] 问题改写失败，回退原问题:', error?.message || error);
+    return { question: trimmed, rewritten: false };
+  }
 }
 
 function pickTopSources(retrievedChunks, limit = MAX_SOURCE_DOCS) {
@@ -308,8 +386,57 @@ function hasAnswerEvidence(denseHits, fusedChunks, question) {
     || bestBm25 > 0;
 }
 
+async function retrieveCategoryMatches(question, categoryId, questionEmbedding) {
+  if (!categoryId) {
+    return { denseHits: [], bm25Hits: [], fusedChunks: [], hasGoodMatch: false };
+  }
+
+  const [denseHits, bm25Hits] = await Promise.all([
+    queryChunks(questionEmbedding, { categoryId, topK: DENSE_RECALL_K }).catch((error) => {
+      console.error('[QA] 知识库向量召回失败', error?.message || error);
+      return [];
+    }),
+    retrieveByBM25(question, { categoryId, topK: BM25_RECALL_K }).catch((error) => {
+      console.error('[QA] 知识库 BM25 召回失败', error?.message || error);
+      return [];
+    })
+  ]);
+
+  const fusedChunks = await rerankIfEnabled(
+    question.trim(),
+    fuseRanks(denseHits, bm25Hits, RERANK_RECALL_K),
+    MAX_RECALL_CHUNKS
+  );
+
+  return {
+    denseHits,
+    bm25Hits,
+    fusedChunks,
+    hasGoodMatch: hasAnswerEvidence(denseHits, fusedChunks, question.trim())
+  };
+}
+
+function buildCategorySuggestionFromDoc(docItem, categoriesById) {
+  if (!docItem?.doc?.categoryId) return null;
+  const categoryId = String(docItem.doc.categoryId || '');
+  if (!categoryId) return null;
+
+  return {
+    id: categoryId,
+    name: categoriesById.get(categoryId) || '未知知识库',
+    score: Number((Math.max(0, docItem.hybridScore || 0) / 6 + Math.max(0, docItem.keywordScore || 0) / 4 + Math.max(0, docItem.bm25Score || 0) + Math.max(0, docItem.vectorScore || 0) * 4).toFixed(2)),
+    topTitle: docItem.doc.title || '',
+    topScore: Number((docItem.hybridScore || 0).toFixed(2)),
+    hits: 1,
+    switchable: true,
+    documentId: String(docItem.doc._id || ''),
+    documentTitle: docItem.doc.title || ''
+  };
+}
+
 // 当前知识库没有可靠结果时，在其他知识库中找出最相关的一个作为切换建议。
 async function findAlternativeRecommendation(question, currentCategoryId, allDocs, categoriesById, questionEmbedding) {
+  const normalizedQuestion = String(question || '').trim();
   const otherDocs = allDocs.filter((doc) => String(doc.categoryId || '') !== String(currentCategoryId));
   const [globalDenseHits, globalBm25Hits] = await Promise.all([
     queryChunks(questionEmbedding, { topK: DENSE_RECALL_K }).catch(() => []),
@@ -321,13 +448,46 @@ async function findAlternativeRecommendation(question, currentCategoryId, allDoc
     bm25Hits: globalBm25Hits
   });
 
-  // 推荐也必须达到“能回答问题”的语义证据线（DENSE_CONFIRM_THRESHOLD），
-  // 否则说明所有知识库都没有相关内容，不应给出任何切换建议。
-  const reliableDocs = alternativeHybridDocs.filter((item) => item.vectorScore >= DENSE_CONFIRM_THRESHOLD);
+  const rankedDocs = [...alternativeHybridDocs].sort((a, b) => {
+    if (b.hybridScore !== a.hybridScore) return b.hybridScore - a.hybridScore;
+    if (b.keywordScore !== a.keywordScore) return b.keywordScore - a.keywordScore;
+    if (b.bm25Score !== a.bm25Score) return b.bm25Score - a.bm25Score;
+    return b.vectorScore - a.vectorScore;
+  });
+
+  const topDoc = rankedDocs[0] || null;
+  const canAutoSwitch = Boolean(topDoc && (
+    topDoc.keywordScore > 0 ||
+    topDoc.bm25Score > 0 ||
+    topDoc.vectorScore >= 0.15 ||
+    topDoc.hybridScore >= 8
+  ));
+
+  const reliableDocs = rankedDocs.filter((item) =>
+    item.vectorScore >= DENSE_CONFIRM_THRESHOLD
+    || item.keywordScore >= 4
+    || item.bm25Score > 0
+    || item.hybridScore >= 8
+  );
 
   const recommended = buildRecommendedKnowledge(reliableDocs, categoriesById);
-  const top = recommended[0] || null;
-  return { recommendedKnowledge: top ? recommended : [], suggestedCategory: top };
+  const suggestedCategory = canAutoSwitch ? buildCategorySuggestionFromDoc(topDoc, categoriesById) : null;
+
+  return {
+    recommendedKnowledge: recommended.length ? recommended : (suggestedCategory ? [suggestedCategory] : []),
+    suggestedCategory,
+    topMatchedDocument: topDoc?.doc?.title || ''
+  };
+}
+
+// 把本轮问答追加进会话历史（只保留最近 MAX_HISTORY_MESSAGES 条，防止无限膨胀）。
+function appendTurnToHistory(history, questionText, answerText, sources = []) {
+  const next = [
+    ...(Array.isArray(history) ? history : []),
+    { role: 'user', content: String(questionText || ''), sources: [] },
+    { role: 'assistant', content: String(answerText || ''), sources: Array.isArray(sources) ? sources : [] }
+  ];
+  return next.slice(-MAX_HISTORY_MESSAGES);
 }
 
 /**
@@ -416,7 +576,10 @@ router.post('/ask', async (req, res) => {
     const categories = await KnowledgeCategory.find({}, { _id: 1, name: 1 }).lean();
     const categoriesById = new Map(categories.map((item) => [String(item._id), item.name]));
 
-    const questionEmbedding = await embedQuery(question.trim());
+    // 多轮对话：先读会话历史，判断是否需要把追问改写成独立问题，再向量化用于检索。
+    const historyMessages = await loadSessionHistoryMessages(sessionId);
+    const { question: rewrittenQuestion } = await rewriteQuestion(question.trim(), historyMessages);
+    const questionEmbedding = await embedQuery(rewrittenQuestion);
     const currentCategory = categoryId ? categoriesById.get(String(categoryId)) : '';
 
     // 1) 对当前知识库做 chunk 级双路召回：Chroma 稠密 + BM25 稀疏，RRF 融合。
@@ -431,17 +594,17 @@ router.post('/ask', async (req, res) => {
           console.error('[QA] 当前知识库向量召回失败', error?.message || error);
           return [];
         }),
-        retrieveByBM25(question.trim(), { categoryId, topK: BM25_RECALL_K }).catch((error) => {
+        retrieveByBM25(rewrittenQuestion, { categoryId, topK: BM25_RECALL_K }).catch((error) => {
           console.error('[QA] 当前知识库 BM25 召回失败', error?.message || error);
           return [];
         })
       ]);
       fusedChunks = await rerankIfEnabled(
-        question.trim(),
+        rewrittenQuestion,
         fuseRanks(currentDenseHits, currentBm25Hits, RERANK_RECALL_K),
         MAX_RECALL_CHUNKS
       );
-      currentHasGoodMatch = hasAnswerEvidence(currentDenseHits, fusedChunks, question.trim());
+      currentHasGoodMatch = hasAnswerEvidence(currentDenseHits, fusedChunks, rewrittenQuestion);
       console.log('[QA] 当前知识库召回', {
         denseHits: currentDenseHits.length,
         bm25Hits: currentBm25Hits.length,
@@ -452,10 +615,10 @@ router.post('/ask', async (req, res) => {
       // 未选知识库时全库检索直接回答
       const [globalDense, globalBm25] = await Promise.all([
         queryChunks(questionEmbedding, { topK: DENSE_RECALL_K }).catch(() => []),
-        retrieveByBM25(question.trim(), { topK: BM25_RECALL_K }).catch(() => [])
+        retrieveByBM25(rewrittenQuestion, { topK: BM25_RECALL_K }).catch(() => [])
       ]);
       fusedChunks = await rerankIfEnabled(
-        question.trim(),
+        rewrittenQuestion,
         fuseRanks(globalDense, globalBm25, RERANK_RECALL_K),
         MAX_RECALL_CHUNKS
       );
@@ -480,32 +643,20 @@ router.post('/ask', async (req, res) => {
     let autoSwitched = false;
 
     if (categoryId && !currentHasGoodMatch) {
-      const alt = await findAlternativeRecommendation(question.trim(), categoryId, allDocs, categoriesById, questionEmbedding);
+      const alt = await findAlternativeRecommendation(rewrittenQuestion, categoryId, allDocs, categoriesById, questionEmbedding);
       recommendedKnowledge = alt.recommendedKnowledge;
       suggestedCategory = alt.suggestedCategory;
 
-      if (suggestedCategory && suggestedCategory.score >= RECOMMENDATION_MIN_SCORE) {
+      if (suggestedCategory) {
         // 自动路由：用推荐知识库重新做双路召回，确认有可靠答案后替换当前召回结果。
-        const [routedDenseHits, routedBm25Hits] = await Promise.all([
-          queryChunks(questionEmbedding, { categoryId: suggestedCategory.id, topK: DENSE_RECALL_K }).catch((error) => {
-            console.error('[QA] 路由知识库向量召回失败', error?.message || error);
-            return [];
-          }),
-          retrieveByBM25(question.trim(), { categoryId: suggestedCategory.id, topK: BM25_RECALL_K }).catch((error) => {
-            console.error('[QA] 路由知识库 BM25 召回失败', error?.message || error);
-            return [];
-          })
-        ]);
-
-        const routedFusedChunks = await rerankIfEnabled(
-          question.trim(),
-          fuseRanks(routedDenseHits, routedBm25Hits, RERANK_RECALL_K),
-          MAX_RECALL_CHUNKS
+        const routed = await retrieveCategoryMatches(
+          rewrittenQuestion,
+          suggestedCategory.id,
+          questionEmbedding
         );
-        const routedHasGoodMatch = hasAnswerEvidence(routedDenseHits, routedFusedChunks, question.trim());
 
-        if (routedHasGoodMatch) {
-          fusedChunks = routedFusedChunks;
+        if (routed.hasGoodMatch) {
+          fusedChunks = routed.fusedChunks;
           currentHasGoodMatch = true;
           routedCategoryId = suggestedCategory.id;
           routedCategoryName = suggestedCategory.name;
@@ -522,7 +673,7 @@ router.post('/ask', async (req, res) => {
             currentCategoryScore,
             suggestedCategoryScore: suggestedCategory.score,
             currentCategoryName: currentCategory || '',
-            topMatchedDocument: '',
+            topMatchedDocument: suggestedCategory.topTitle || '',
             isHighlyRelevant: true,
             scoreGap: Number((suggestedCategory.score - currentCategoryScore).toFixed(2)),
             shouldForceSwitch: false
@@ -567,13 +718,16 @@ router.post('/ask', async (req, res) => {
     const context = currentHasGoodMatch ? buildContext(retrievedChunks) : '';
     console.log('[QA] 最终上下文长度', context.length);
 
-    const sources = currentHasGoodMatch ? pickTopSources(retrievedChunks, MAX_SOURCE_DOCS) : [];
-    console.log('[QA] 返回 sources 数量', sources.length);
+    let finalSources = currentHasGoodMatch ? pickTopSources(retrievedChunks, MAX_SOURCE_DOCS) : [];
+    console.log('[QA] 返回 sources 数量', finalSources.length);
 
-    sendSSE(res, 'sources', sources);
+    sendSSE(res, 'sources', finalSources);
 
-    const prompt = buildPrompt(question.trim(), context);
-    const finalSessionId = sessionId || Date.now().toString();
+    const prompt = buildPrompt(question.trim(), context, { historyMessages, rewrittenQuestion });
+    // sessionId 必须是合法 ObjectId 才能跨轮关联到同一个 ChatSession（历史版本用时间戳导致永远关联不上）。
+    const finalSessionId = sessionId && mongoose.Types.ObjectId.isValid(sessionId)
+      ? sessionId
+      : new mongoose.Types.ObjectId().toString();
     let fullAnswer = '';
 
     let categoryName = '';
@@ -587,88 +741,124 @@ router.post('/ask', async (req, res) => {
     const answeredCategoryName = autoSwitched ? routedCategoryName : categoryName;
 
     if (!currentHasGoodMatch) {
-      const noMatchAnswer = suggestedCategory
-        ? '当前知识库没有找到答案，已为你推荐更相关的知识库。'
-        : '当前系统知识库无相关内容。';
+      const alt = await findAlternativeRecommendation(rewrittenQuestion, categoryId, allDocs, categoriesById, questionEmbedding);
+      recommendedKnowledge = alt.recommendedKnowledge;
+      suggestedCategory = alt.suggestedCategory;
 
-      const responseTime = Date.now() - startTime;
-      try {
-        await QALog.create({
-          question: question.trim(),
-          answer: noMatchAnswer,
-          categoryId: answeredCategoryId,
-          categoryName: answeredCategoryName,
-          userId: getRequestUser(req).userId || null,
-          sources: [],
-          sessionId: finalSessionId,
-          responseTime,
-          status: 'failed',
-          errorMessage: noMatchAnswer
-        });
-        console.log('[QA] 问答日志已记录');
-      } catch (logError) {
-        console.error('[QA] 记录问答日志失败:', logError);
-      }
+      if (suggestedCategory) {
+        const routed = await retrieveCategoryMatches(rewrittenQuestion, suggestedCategory.id, questionEmbedding);
+        if (routed.hasGoodMatch) {
+          fusedChunks = routed.fusedChunks;
+          currentHasGoodMatch = true;
+          routedCategoryId = suggestedCategory.id;
+          routedCategoryName = suggestedCategory.name;
+          autoSwitched = true;
+          finalSources = pickTopSources(fusedChunks, MAX_SOURCE_DOCS);
+          recommendedKnowledge = [];
 
-      try {
-        const userId = getRequestUser(req).userId;
-        const userObjectId = userId && mongoose.Types.ObjectId.isValid(userId)
-          ? new mongoose.Types.ObjectId(userId)
-          : null;
-        const categoryObjectId = answeredCategoryId && mongoose.Types.ObjectId.isValid(answeredCategoryId)
-          ? new mongoose.Types.ObjectId(answeredCategoryId)
-          : null;
-
-        let session = null;
-        if (sessionId && mongoose.Types.ObjectId.isValid(sessionId)) {
-          session = await ChatSession.findById(sessionId);
-        }
-
-        if (!session) {
-          session = new ChatSession({
-            userId: userObjectId,
-            categoryId: categoryObjectId,
-            title: String(question || '').trim().slice(0, 18) || '新的对话',
-            lastQuestion: String(question || ''),
-            lastAnswer: noMatchAnswer,
-            messageCount: 0,
-            history: []
+          sendSSE(res, 'mismatch', {
+            message: '当前知识库没有找到答案，已自动切换到更相关的知识库。',
+            autoSwitched: true,
+            answeredByKnowledgeId: routedCategoryId,
+            answeredByKnowledge: routedCategoryName,
+            suggestedKnowledge: suggestedCategory.name,
+            suggestedKnowledgeId: suggestedCategory.id,
+            recommendedKnowledge: [],
+            currentCategoryScore,
+            suggestedCategoryScore: suggestedCategory.score,
+            currentCategoryName: currentCategory || '',
+            topMatchedDocument: alt.topMatchedDocument || '',
+            isHighlyRelevant: true,
+            scoreGap: Number((suggestedCategory.score - currentCategoryScore).toFixed(2)),
+            shouldForceSwitch: false
           });
+        } else {
+          finalSources = [];
         }
-
-        session.userId = session.userId || userObjectId;
-        session.categoryId = session.categoryId || categoryObjectId;
-        session.title = session.title || String(question || '').trim().slice(0, 18) || '新的对话';
-        session.lastQuestion = String(question || '');
-        session.lastAnswer = noMatchAnswer;
-        session.history = [
-          { role: 'user', content: String(question || ''), sources: [] },
-          { role: 'assistant', content: noMatchAnswer, sources: [] }
-        ];
-        session.messageCount = session.history.length;
-        await session.save();
-        console.log('[QA] 对话历史已记录', String(session._id));
-      } catch (historyError) {
-        console.error('[QA] 记录对话历史失败:', historyError);
       }
 
-      sendSSE(res, 'done', {
-        answer: noMatchAnswer,
-        sessionId: finalSessionId,
-        sources: [],
-        recommendedKnowledge,
-        suggestedKnowledge: suggestedCategory?.name || '',
-        suggestedKnowledgeId: suggestedCategory?.id || ''
-      });
-      res.end();
-      return;
+      if (!currentHasGoodMatch) {
+        const noMatchAnswer = suggestedCategory
+          ? '当前知识库没有找到答案，已自动切换到更相关的知识库。'
+          : '当前系统知识库无相关内容。';
+
+        const responseTime = Date.now() - startTime;
+        try {
+          await QALog.create({
+            question: String(question || '').trim(),
+            answer: noMatchAnswer,
+            categoryId: answeredCategoryId,
+            categoryName: answeredCategoryName,
+            userId: getRequestUser(req).userId || null,
+            sources: [],
+            sessionId: finalSessionId,
+            responseTime,
+            status: 'failed',
+            errorMessage: noMatchAnswer
+          });
+          console.log('[QA] 问答日志已记录');
+        } catch (logError) {
+          console.error('[QA] 记录问答日志失败:', logError);
+        }
+
+        try {
+          const userId = getRequestUser(req).userId;
+          const userObjectId = userId && mongoose.Types.ObjectId.isValid(userId)
+            ? new mongoose.Types.ObjectId(userId)
+            : null;
+          const categoryObjectId = answeredCategoryId && mongoose.Types.ObjectId.isValid(answeredCategoryId)
+            ? new mongoose.Types.ObjectId(answeredCategoryId)
+            : null;
+
+          let session = null;
+          if (finalSessionId) {
+            session = await ChatSession.findById(finalSessionId);
+          }
+
+          if (!session) {
+            session = new ChatSession({
+              _id: finalSessionId,
+              userId: userObjectId,
+              categoryId: categoryObjectId,
+              title: String(question || '').trim().slice(0, 18) || '新的对话',
+              lastQuestion: String(question || ''),
+              lastAnswer: noMatchAnswer,
+              messageCount: 0,
+              history: []
+            });
+          }
+
+          session.userId = session.userId || userObjectId;
+          session.categoryId = session.categoryId || categoryObjectId;
+          session.title = session.title || String(question || '').trim().slice(0, 18) || '新的对话';
+          session.lastQuestion = String(question || '');
+          session.lastAnswer = noMatchAnswer;
+          session.history = appendTurnToHistory(session.history, question, noMatchAnswer);
+          session.messageCount = session.history.length;
+          await session.save();
+          console.log('[QA] 对话历史已记录', String(session._id));
+        } catch (historyError) {
+          console.error('[QA] 记录对话历史失败:', historyError);
+        }
+
+        sendSSE(res, 'done', {
+          answer: noMatchAnswer,
+          sessionId: finalSessionId,
+          sources: [],
+          recommendedKnowledge,
+          suggestedKnowledge: suggestedCategory?.name || '',
+          suggestedKnowledgeId: suggestedCategory?.id || ''
+        });
+        res.end();
+        return;
+      }
     }
 
     try {
       console.log('[QA] 开始流式调用大模型...');
       fullAnswer = await generateAnswerStream(prompt, (chunk) => {
         sendSSE(res, 'chunk', chunk);
-      });
+      }, { historyMessages });
       console.log('[QA] 大模型返回长度', String(fullAnswer || '').length);
     } catch (answerError) {
       console.error('[QA] 大模型调用失败:', answerError);
@@ -681,21 +871,41 @@ router.post('/ask', async (req, res) => {
     const answeredUncertain = !String(fullAnswer || '').trim()
       || NON_ANSWER_MARKERS.some((marker) => String(fullAnswer || '').includes(marker));
     if (categoryId && answeredUncertain && !suggestedCategory) {
-      const alt = await findAlternativeRecommendation(question.trim(), categoryId, allDocs, categoriesById, questionEmbedding);
+      const alt = await findAlternativeRecommendation(rewrittenQuestion, categoryId, allDocs, categoriesById, questionEmbedding);
       recommendedKnowledge = alt.recommendedKnowledge;
       suggestedCategory = alt.suggestedCategory;
 
-      if (suggestedCategory && suggestedCategory.score >= RECOMMENDATION_MIN_SCORE) {
+      if (suggestedCategory) {
+        const routed = await retrieveCategoryMatches(question.trim(), suggestedCategory.id, questionEmbedding);
+        const routedHasGoodMatch = routed.hasGoodMatch;
+        if (routedHasGoodMatch) {
+          fusedChunks = routed.fusedChunks;
+          currentHasGoodMatch = true;
+          routedCategoryId = suggestedCategory.id;
+          routedCategoryName = suggestedCategory.name;
+          autoSwitched = true;
+          finalSources = pickTopSources(fusedChunks, MAX_SOURCE_DOCS);
+        }
+
+        if (!routedHasGoodMatch) {
+          finalSources = [];
+        }
+
         sendSSE(res, 'mismatch', {
-          message: '当前知识库没有找到答案，已为你推荐更相关的知识库。',
+          message: routedHasGoodMatch
+            ? '当前知识库没有找到答案，已自动切换到更相关的知识库。'
+            : '当前知识库没有找到答案，已为你推荐更相关的知识库。',
+          autoSwitched: routedHasGoodMatch,
+          answeredByKnowledgeId: routedHasGoodMatch ? suggestedCategory.id : '',
+          answeredByKnowledge: routedHasGoodMatch ? suggestedCategory.name : '',
           suggestedKnowledge: suggestedCategory.name,
           suggestedKnowledgeId: suggestedCategory.id,
           recommendedKnowledge,
           currentCategoryScore,
           suggestedCategoryScore: suggestedCategory.score,
           currentCategoryName: currentCategory || '',
-          topMatchedDocument: '',
-          isHighlyRelevant: false,
+          topMatchedDocument: alt.topMatchedDocument || '',
+          isHighlyRelevant: true,
           scoreGap: Number((suggestedCategory.score - currentCategoryScore).toFixed(2)),
           shouldForceSwitch: false
         });
@@ -726,7 +936,7 @@ router.post('/ask', async (req, res) => {
         categoryId: answeredCategoryId,
         categoryName: answeredCategoryName,
         userId: getRequestUser(req).userId || null,
-        sources: sources.map((s) => s.title),
+        sources: finalSources.map((s) => s.title),
         sessionId: finalSessionId,
         responseTime,
         status: fullAnswer ? 'success' : 'failed',
@@ -747,12 +957,13 @@ router.post('/ask', async (req, res) => {
         : null;
 
       let session = null;
-      if (sessionId && mongoose.Types.ObjectId.isValid(sessionId)) {
-        session = await ChatSession.findById(sessionId);
+      if (finalSessionId) {
+        session = await ChatSession.findById(finalSessionId);
       }
 
       if (!session) {
         session = new ChatSession({
+          _id: finalSessionId,
           userId: userObjectId,
           categoryId: categoryObjectId,
           title: String(question || '').trim().slice(0, 18) || '新的对话',
@@ -768,10 +979,12 @@ router.post('/ask', async (req, res) => {
       session.title = session.title || String(question || '').trim().slice(0, 18) || '新的对话';
       session.lastQuestion = String(question || '');
       session.lastAnswer = String(fullAnswer || '');
-      session.history = [
-        { role: 'user', content: String(question || ''), sources: [] },
-        { role: 'assistant', content: String(fullAnswer || '根据当前知识库内容暂时无法确定。'), sources }
-      ];
+      session.history = appendTurnToHistory(
+        session.history,
+        question,
+        fullAnswer || '根据当前知识库内容暂时无法确定。',
+        finalSources
+      );
       session.messageCount = session.history.length;
       await session.save();
       console.log('[QA] 对话历史已记录', String(session._id));
@@ -782,7 +995,7 @@ router.post('/ask', async (req, res) => {
     sendSSE(res, 'done', {
       answer: fullAnswer || '根据当前知识库内容暂时无法确定。',
       sessionId: finalSessionId,
-      sources,
+      sources: finalSources,
       recommendedKnowledge,
       suggestedKnowledge: autoSwitched ? routedCategoryName : (suggestedCategory?.name || ''),
       suggestedKnowledgeId: autoSwitched ? routedCategoryId : (suggestedCategory?.id || ''),

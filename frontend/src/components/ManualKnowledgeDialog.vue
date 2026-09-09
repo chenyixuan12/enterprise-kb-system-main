@@ -146,8 +146,18 @@ function updatePlainTextLength() {
   plainTextLength.value = text.trim().length;
 }
 
+function editorHtmlToPlainText(html = '') {
+  if (!html) return '';
+  const container = document.createElement('div');
+  container.innerHTML = html;
+  return (container.innerText || container.textContent || '')
+    .replace(/\u00a0/g, ' ')
+    .replace(/[ \t]+\n/g, '\n')
+    .trim();
+}
+
 function syncEditorToForm() {
-  form.content = editorRef.value?.innerHTML || '';
+  form.content = editorHtmlToPlainText(editorRef.value?.innerHTML || '');
   updatePlainTextLength();
 }
 
@@ -264,11 +274,39 @@ function isActiveFormat(command) {
   }
 }
 
+const CN_NUM = '[0-9一二三四五六七八九十百]+';
+// “第 X 章 第 Y 点”合并标记（中间空白任意），用于整体识别
+const CHAPTER_POINT_RE = new RegExp(`第\\s*(${CN_NUM})\\s*章\\s*第\\s*(${CN_NUM})\\s*点`, 'g');
+
 function normalizeCompletionText(text) {
   return String(text || '')
     .replace(/^\s+/, '')
     .replace(/^[，,。．.：:；;、—-]+\s*/, '')
     .trim();
+}
+
+// 将 AI 补全文本规范为固定排版：第 X 章、第 Y 点各自独占一行，点后正文另起一行
+function formatCompletionParagraphs(text) {
+  const normalized = String(text || '')
+    .replace(/\r\n?/g, '\n')
+    // 统一章点标记：“第一章 第1点”去掉内部空白，便于识别
+    .replace(CHAPTER_POINT_RE, '第$1章第$2点')
+    .replace(/[ \t]*\n[ \t]*/g, '\n')
+    .trim();
+  if (!normalized) return '';
+
+  const formatted = normalized
+    // 句读后的“第X章 / 第Y点”另起一行（“按第3点执行”这类引用不在句读后，不会被误拆）
+    .replace(new RegExp(`([。！？；，,])第(${CN_NUM})章`, 'g'), '$1\n第$2章')
+    .replace(new RegExp(`([。！？；，,])第(${CN_NUM})点`, 'g'), '$1\n第$2点')
+    // “第X章”与“第Y点”各自独占一行
+    .replace(new RegExp(`(第${CN_NUM}章)(第${CN_NUM}点)`, 'g'), '$1\n$2')
+    // 行首“第Y点：”之后的正文另起一行
+    .replace(new RegExp(`^(第${CN_NUM}点[：:]?)[ \\t]*([^\\n，。、；,;])`, 'gm'), '$1\n$2');
+
+  return normalizeCompletionText(
+    formatted.split('\n').map((line) => line.trim()).filter(Boolean).join('\n')
+  );
 }
 
 function extractChapterIndex(text) {
@@ -304,7 +342,8 @@ function buildCompletionRetryPrompt(baseContent, previousCompletion) {
 2. 内容不少于 500 字。
 3. 必须从“第 ${nextChapter} 章 第 ${nextPoint} 点”开始组织。
 4. 每一章至少包含 2 个小点，每个小点内容完整、具体、可直接入库。
-5. 避免与前文重复。`;
+5. 严格分行排版：“第 X 章”独占一行，“第 Y 点”独占一行，每点正文从新的一行开始，禁止把章、点和正文连在一行。
+6. 避免与前文重复。`;
 }
 
 function isCompletionAcceptable(text) {
@@ -387,7 +426,7 @@ async function handleTabCompletion() {
       return;
     }
 
-    insertHtmlAtCursor(completion.replace(/\n/g, '<br>'));
+    insertHtmlAtCursor(formatCompletionParagraphs(completion).replace(/\n/g, '<br>'));
     streamPreview.value = '';
     ElMessage.success('AI 补全完成');
   } catch (error) {
